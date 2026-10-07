@@ -199,8 +199,10 @@ describe('panel', () => {
       const ui = await $.ui.mount({ ...PANE, surface })
       expect(await ui.find({ text: /VENTANAS/ })).toBeDefined()
       expect(await ui.find({ text: /1,10×/ })).toBeDefined()
-      expect(await ui.find({ text: /SEMANA/ })).toBeDefined()
       expect(await ui.find({ key: 'close' })).toBeDefined()
+      await ui.press({ key: 'tab-semana' })
+      expect(await ui.find({ text: /SEMANA/ })).toBeDefined()
+      await ui.press({ key: 'tab-resumen' })
       await ui.unmount()
     }
   })
@@ -306,5 +308,39 @@ describe('datos del turno', () => {
       expect(await ui.find({ text: /Pensando… \(14s\) · ctx 15% · turno ~US\$0,09/ })).toBeDefined()
       await ui.unmount()
     }
+  })
+})
+
+describe('diseño de la línea', () => {
+  const OPEN = { command: 'cuota', args: '', origin: { kind: 'composer' as const }, presentation: { isFullscreen: true, columns: 150 } }
+
+  test('ocultar, mover y cambiar el estilo se ve en la línea de abajo del prompt', async ($, on) => {
+    await start($, on, usage(31, [five(42, 134), seven(29)]))
+    await $.command.run(OPEN)
+    const pane = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    await pane.press({ key: 'tab-diseno' })
+    expect(await pane.find({ text: /VISTA PREVIA/ })).toBeDefined()
+    await pane.press({ key: 'seg-seven' })
+    await pane.press({ key: 'up-five' })
+    await pane.press({ key: 'style-next' })
+    expect(await pane.find({ text: /píldoras/ })).toBeDefined()
+    await pane.unmount()
+
+    const line = await $.ui.mount({ ...HINT, surface: 'terminal' })
+    const texts = (await line.findAll({ type: 'Text' })).map(found => found.text).join('')
+    expect(texts).not.toContain('7d')
+    expect(texts.indexOf('5h 42%')).toBeLessThan(texts.indexOf('ctx 31%'))
+    expect((await line.findAll({ type: 'Text' })).some(found => found.props.backgroundColor === 'subtle')).toBe(true)
+    await line.unmount()
+  })
+
+  test('el estilo elegido en /config se toma al arrancar', { options: { lineStyle: 'minima' } }, async ($, on) => {
+    await start($, on, usage(31, [five(42, 134)]))
+    const line = await $.ui.mount({ ...HINT, surface: 'terminal' })
+    const texts = (await line.findAll({ type: 'Text' })).map(found => found.text).join('')
+    expect(texts).toContain('31%')
+    expect(texts).not.toContain('ctx 31%')
+    expect(texts).toContain('●')
+    await line.unmount()
   })
 })

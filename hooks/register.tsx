@@ -57,12 +57,14 @@ import {
   weekGrid,
   weekKeys,
 } from './math'
-import type { Alert, CompactAdvice, DayRecord, Piece, Thresholds, Tone, View, WindowView } from './math'
+import type { Alert, CompactAdvice, DayRecord, Piece, Thresholds, Tone, WindowView } from './math'
+import { SEGMENT_NAMES, STYLE_NAMES, asLayout, lineRows, moveSegment, shiftStyle, toggleSegment, withConfigStyle } from './line'
+import type { CacheState, Layout, LineInput } from './line'
 
 type $ = EngineInterface
 
-/** What the manifest's userConfig sets: the thresholds, the payback horizon and the model the downshift button picks. */
-type Config = { t: Thresholds; paybackTurns: number; target: string; targetLabel: string }
+/** What the manifest's userConfig sets: the thresholds, the payback horizon, the line's style and the downshift model. */
+type Config = { t: Thresholds; paybackTurns: number; lineStyle?: string; target: string; targetLabel: string }
 
 const PANE = 'cuota'
 const MIN = 60_000
@@ -78,6 +80,17 @@ const PANE_OPEN = atom({ plugin: 'cuota', key: 'paneOpen' } as const, false)
 const COMPACT = atom({ plugin: 'cuota', key: 'compact' } as const, null)
 const TURN = atom({ plugin: 'cuota', key: 'turn' } as const, null)
 const TURNS = atom({ plugin: 'cuota', key: 'turns' } as const, [])
+const LAYOUT = atom({ plugin: 'cuota', key: 'layout' } as const, null)
+const PANE_TAB = atom({ plugin: 'cuota', key: 'paneTab' } as const, 'resumen')
+
+/** The pane's tabs, in the order their digit hotkeys follow. */
+const TABS = [
+  ['resumen', 'Resumen'],
+  ['contexto', 'Contexto'],
+  ['ritmo', 'Ritmo'],
+  ['semana', 'Semana'],
+  ['diseno', 'Diseño'],
+] as const
 
 // The last status text sent, so the clock does not resend the same line every minute
 let lastStatus: string | undefined
@@ -98,15 +111,17 @@ function configOf(options: PluginOptions): Config {
       sevenDayFloor: numberOption(options.sevenDayFloor, DEFAULTS.sevenDayFloor),
     },
     paybackTurns: numberOption(options.compactPaybackTurns, 2),
+    ...(typeof options.lineStyle === 'string' ? { lineStyle: options.lineStyle } : {}),
     target,
     targetLabel: target.charAt(0).toUpperCase() + target.slice(1),
   }
 }
 
 /** Text props for a piece, leaving out what it does not set (the surfaces refuse undefined props). */
-function textProps(piece: { tone?: Tone; bold?: boolean; dim?: boolean }) {
+function textProps(piece: { tone?: Tone; bold?: boolean; dim?: boolean; bg?: string }) {
   return {
     ...(piece.tone !== undefined && piece.tone !== 'text' ? { color: piece.tone } : {}),
+    ...(piece.bg !== undefined ? { backgroundColor: piece.bg } : {}),
     ...(piece.bold === true ? { bold: true } : {}),
     ...(piece.dim === true ? { dimColor: true } : {}),
   }
@@ -193,6 +208,7 @@ async function refresh($: $, cfg: Config) {
   const now = await $.clock.now()
   await update($, TICK, () => now)
   await loadCompact($, now)
+  await loadLayout($, cfg)
   try {
     const u = await $.session.usage()
     const reading = fromUsage(u, u.startedAt, now)
@@ -467,47 +483,50 @@ async function hide($: $, alert: Alert) {
 
 // ── The fixed line ────────────────────────────────────────────────────
 
-/** The fixed line as pieces, the optional ones marked so a narrow band drops them first. */
-function linePieces(view: View | null, model: CuotaModel | null, history: CuotaHistory | null, now: number): Piece[] {
-  const pieces: Piece[] = []
-  const sep: Piece = { text: '  ·  ', dim: true }
-  if (model !== null) {
-    const family = modelFamily(model.model)
-    pieces.push({ text: family.label, tone: family.tone, bold: true })
-    if (model.effort !== undefined) pieces.push({ text: ` ${model.effort}`, dim: true, drop: 4 })
-    if (model.isFallback) pieces.push({ text: ' fallback', tone: 'warning', drop: 1 })
-  }
-  if (view === null) {
-    if (pieces.length > 0) pieces.push(sep)
-    pieces.push({ text: 'cuota · esperando la primera respuesta', dim: true })
-    return pieces
-  }
+/** Whether the prompt cache is still warm; nothing until a response has put the context in it. */
+function cacheStateOf(reading: CuotaReading, compact: CuotaCompact, now: number): CacheState | null {
+  if (reading.tokens === undefined) return null
+  const ttl = cacheTtlMs(reading)
+  const idle = Math.max(0, now - compact.lastResponseAt)
+  return { isWarm: idle <= ttl, leftMs: Math.max(0, ttl - idle), idleMs: idle }
+}
 
-  if (pieces.length > 0) pieces.push(sep)
-  const ctx = view.context
-  if (ctx.percent === undefined) {
-    pieces.push({ text: 'ctx —', dim: true })
-  } else {
-    const glyph = glyphOf(ctx.level)
-    pieces.push({ text: `${glyph === '' ? '' : `${glyph} `}ctx ${Math.round(ctx.percent)}%`, tone: toneOf(ctx.level) })
-    const b = bar(ctx.percent / 100, 10)
-    pieces.push({ text: ` ${b.full}`, tone: ctx.level === 'ok' ? 'success' : toneOf(ctx.level), drop: 5 })
-    pieces.push({ text: b.empty, dim: true, drop: 5 })
+/** Everything the line draws from, gathered from the session's state. */
+function lineInputOf(
+  reading: CuotaReading | null,
+  model: CuotaModel | null,
+  history: CuotaHistory | null,
+  compact: CuotaCompact | null,
+  now: number,
+  cfg: Config,
+): LineInput {
+  return {
+    view: reading === null ? null : buildView(reading, now, cfg.t),
+    model,
+    history,
+    cache: reading === null || compact === null ? null : cacheStateOf(reading, compact, now),
+    ...(reading?.costUsd === undefined ? {} : { costUsd: reading.costUsd }),
+    now,
   }
+}
 
-  for (const w of view.windows) {
-    pieces.push(sep)
-    const glyph = glyphOf(w.level)
-    pieces.push({ text: `${glyph === '' ? '' : `${glyph} `}${w.short} ${Math.round(w.used)}%`, tone: toneOf(w.level) })
-    if (w.kind === 'five_hour') {
-      if (w.leftMs !== undefined) pieces.push({ text: `  ↻ ${formatCountdown(w.leftMs)}`, dim: true, drop: 2 })
-      const series = history?.fiveSeries ?? []
-      if (series.filter(v => v !== null).length >= 2) pieces.push({ text: ` ${spark(series, 10)}`, dim: true, drop: 6 })
-    } else if (w.resetsAt !== undefined) {
-      pieces.push({ text: `  ↻ ${formatResetAt(w.resetsAt, now)}`, dim: true, drop: 3 })
-    }
-  }
-  return pieces
+/** The saved design, with the /config style applied when it changed since it was last seen. */
+async function loadLayout($: $, cfg: Config) {
+  const stored = asLayout(await $.store.get('layout'))
+  const layout = withConfigStyle(stored, cfg.lineStyle)
+  await update($, LAYOUT, () => layout)
+  if (layout !== stored) await $.store.set('layout', layout)
+}
+
+/** One change from the Design tab: drawn at once and kept for every session. */
+async function editLayout($: $, change: (layout: Layout) => Layout) {
+  const next = change(asLayout(await read($, LAYOUT)))
+  await update($, LAYOUT, () => next)
+  await $.store.set('layout', next)
+}
+
+async function setPaneTab($: $, tab: string) {
+  await update($, PANE_TAB, () => tab)
 }
 
 // ── Hooks ─────────────────────────────────────────────────────────────
@@ -665,12 +684,14 @@ export const register: Register = (on, options) => {
     )
   })
 
-  // The fixed line: a row of its own right under the prompt, with the engine's hint line kept beneath it
+  // The fixed line: its own rows right under the prompt, in the saved order and style; the engine's hint line stays beneath
   on('ui.render', { component: 'PromptHint' }, async ($, e, next) => {
     const { Box, Text } = $.ui.resolve(e)
     const reading = await read($, READING)
     const model = await read($, MODEL)
     const history = await read($, HISTORY)
+    const compact = await read($, COMPACT)
+    const layout = asLayout(await read($, LAYOUT))
     const now = await nowOf($)
 
     let theirs = null
@@ -682,78 +703,179 @@ export const register: Register = (on, options) => {
     if (reading === null && model === null) return theirs ?? <Box />
 
     const columns = Math.max(20, (e.viewport?.columns ?? 100) - 2)
-    const view = reading === null ? null : buildView(reading, now, cfg.t)
-    const pieces = fitPieces(linePieces(view, model, history, now), columns)
+    const rows = lineRows(lineInputOf(reading, model, history, compact, now, cfg), layout, columns)
 
     return (
       <Box flexDirection="column">
-        <Box flexDirection="row">
-          {pieces.map(piece => (
-            <Text {...textProps(piece)}>{piece.text}</Text>
-          ))}
-        </Box>
+        {rows.map(row => (
+          <Box flexDirection="row">
+            {row.map(piece => (
+              <Text {...textProps(piece)}>{piece.text}</Text>
+            ))}
+          </Box>
+        ))}
         {theirs}
       </Box>
     )
   })
 
-  // The pane /cuota opens
+  // The pane /cuota opens: five tabs on digit hotkeys, the actions on letters
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text, Button } = $.ui.resolve(e)
     const reading = await read($, READING)
     const model = await read($, MODEL)
     const history = await read($, HISTORY)
     const categories = await read($, BREAKDOWN)
+    const compact = await read($, COMPACT)
+    const layout = asLayout(await read($, LAYOUT))
+    const tab = await read($, PANE_TAB)
     const now = await nowOf($)
     const columns = Math.max(30, e.props.bodyColumns)
     const barWidth = Math.max(8, Math.min(24, columns - 26))
+    const isOpus = model !== null && modelFamily(model.model).label === 'OPUS'
+    const plan = downshiftOf(reading, compact, model, cfg)
+    const isCompactFirst = plan?.isCompactFirst === true
 
-    if (reading === null) {
-      return (
-        <Box flexDirection="column">
-          <Text dimColor>Todavía no hay cifras: llegan con la primera respuesta del modelo.</Text>
-          <Button key="close" label="Cerrar" hotkey="3" plain onPress={() => closePane($)} />
-        </Box>
-      )
-    }
-
-    const view = buildView(reading, now, cfg.t)
-    const ctx = view.context
     const head = (title: string, right = '') => (
       <Text dimColor bold>
         {right === '' ? title : `${title.padEnd(Math.max(title.length + 1, columns - right.length))}${right}`}
       </Text>
     )
 
-    // Context and its breakdown
-    const ctxRight =
-      ctx.percent === undefined
-        ? 'sin lectura'
-        : `${ctx.tokens === undefined ? '' : `${formatTokens(ctx.tokens)} / `}${formatTokens(ctx.window)}  ${Math.round(ctx.percent)} %`
-    const ctxBar = bar((ctx.percent ?? 0) / 100, barWidth)
-    const biggest = Math.max(1, ...(categories ?? []).map(c => c.tokens))
-
-    // Pace sparkline and week heat map: Raster on the terminal, text elsewhere
-    const series = history?.fiveSeries ?? []
-    const week = history?.week ?? []
-    const weekDays = history?.weekDays ?? []
-    let paceRow = <Text dimColor>{series.some(v => v !== null) ? spark(series, 30) : 'Sin muestras todavía.'}</Text>
-    let weekRows = (
-      <Box flexDirection="column">
-        {week.map((hours, i) => (
-          <Text dimColor>{`${(weekDays[i] ?? '').padEnd(4)}${hours.map(v => (v === null ? '·' : sparkChar(v))).join('')}`}</Text>
+    const tabs = (
+      <Box flexDirection="row" columnGap={2} flexWrap="wrap">
+        {TABS.map(([id, label], i) => (
+          <Button key={`tab-${id}`} label={label} hotkey={String(i + 1)} plain dimColor={tab !== id} onPress={() => setPaneTab($, id)} />
         ))}
       </Box>
     )
-    if (e.surface === 'terminal') {
-      const { Raster } = $.ui.resolve(e)
-      const cell = (v: number | null, char: string) => [char.codePointAt(0) ?? 0x2588, heatColor(v), DEFAULT_COLOR] as const
-      if (series.some(v => v !== null)) {
-        paceRow = (
-          <Raster key="pace" columns={series.length} rows={1} cells={packCells(series.map(v => cell(v, v === null ? '·' : sparkChar(v))))} />
-        )
+
+    const actions = (
+      <Box flexDirection="row" columnGap={3} flexWrap="wrap">
+        <Button key="compact" label="Compactar ahora" hotkey="c" plain onPress={() => compactNow($)} />
+        {isOpus && (
+          <Button
+            key="downshift"
+            label={isCompactFirst ? `Compactar y pasar a ${cfg.targetLabel}` : `Pasar a ${cfg.targetLabel}`}
+            hotkey="m"
+            plain
+            onPress={() => (isCompactFirst ? compactThenDownshift($, cfg) : downshift($, cfg))}
+          />
+        )}
+        <Button key="close" label="Cerrar" hotkey="q" plain onPress={() => closePane($)} />
+      </Box>
+    )
+
+    // ── Diseño: works before the first response too ──
+    if (tab === 'diseno') {
+      const preview = lineRows(lineInputOf(reading, model, history, compact, now, cfg), layout, columns)
+      return (
+        <Box flexDirection="column">
+          {tabs}
+          <Text> </Text>
+          {head('VISTA PREVIA', 'así se ve debajo del prompt')}
+          {preview.map(row => (
+            <Box flexDirection="row">
+              {row.map(piece => (
+                <Text {...textProps(piece)}>{piece.text}</Text>
+              ))}
+            </Box>
+          ))}
+          <Text> </Text>
+          {head('SEGMENTOS', 'orden')}
+          {layout.order.map(id => (
+            <Box flexDirection="row" columnGap={1}>
+              <Button
+                key={`seg-${id}`}
+                label={`${layout.hidden.includes(id) ? '[ ]' : '[x]'} ${SEGMENT_NAMES[id].padEnd(20)}`}
+                plain
+                dimColor={layout.hidden.includes(id)}
+                onPress={() => editLayout($, current => toggleSegment(current, id))}
+              />
+              <Button key={`up-${id}`} label="↑" plain onPress={() => editLayout($, current => moveSegment(current, id, -1))} />
+              <Button key={`down-${id}`} label="↓" plain onPress={() => editLayout($, current => moveSegment(current, id, 1))} />
+            </Box>
+          ))}
+          <Text> </Text>
+          <Box flexDirection="row" columnGap={1}>
+            <Text dimColor bold>ESTILO</Text>
+            <Button key="style-prev" label="‹" plain onPress={() => editLayout($, current => shiftStyle(current, -1))} />
+            <Text>{STYLE_NAMES[layout.style]}</Text>
+            <Button key="style-next" label="›" plain onPress={() => editLayout($, current => shiftStyle(current, 1))} />
+          </Box>
+          <Text dimColor>Los cambios se guardan solos y valen para todas las sesiones.</Text>
+          <Text> </Text>
+          {actions}
+        </Box>
+      )
+    }
+
+    if (reading === null) {
+      return (
+        <Box flexDirection="column">
+          {tabs}
+          <Text> </Text>
+          <Text dimColor>Todavía no hay cifras: llegan con la primera respuesta del modelo.</Text>
+          <Text> </Text>
+          {actions}
+        </Box>
+      )
+    }
+
+    const view = buildView(reading, now, cfg.t)
+    const ctx = view.context
+    let body = null
+
+    if (tab === 'contexto') {
+      // ── Contexto: the window's fill and its breakdown ──
+      const ctxRight =
+        ctx.percent === undefined
+          ? 'sin lectura'
+          : `${ctx.tokens === undefined ? '' : `${formatTokens(ctx.tokens)} / `}${formatTokens(ctx.window)}  ${Math.round(ctx.percent)} %`
+      const ctxBar = bar((ctx.percent ?? 0) / 100, barWidth)
+      const biggest = Math.max(1, ...(categories ?? []).map(c => c.tokens))
+      body = (
+        <Box flexDirection="column">
+          {head('CONTEXTO', ctxRight)}
+          <Box flexDirection="row">
+            <Text {...textProps({ tone: ctx.level === 'ok' ? 'success' : toneOf(ctx.level) })}>{ctxBar.full}</Text>
+            <Text dimColor>{ctxBar.empty}</Text>
+          </Box>
+          {(categories ?? []).map(c => (
+            <Text>{`  ${c.name.slice(0, 16).padEnd(16)} ${formatTokens(c.tokens).padStart(5)}  ${bar(c.tokens / biggest, 8).full}`}</Text>
+          ))}
+          {categories === null && <Text dimColor> Sin desglose: lo da /context.</Text>}
+        </Box>
+      )
+    } else if (tab === 'ritmo') {
+      // ── Ritmo: the five-hour window over the last 5 hours ──
+      const series = history?.fiveSeries ?? []
+      let paceRow = <Text dimColor>{series.some(v => v !== null) ? spark(series, 30) : 'Sin muestras todavía.'}</Text>
+      if (e.surface === 'terminal' && series.some(v => v !== null)) {
+        const { Raster } = $.ui.resolve(e)
+        const cells = series.map(v => [(v === null ? '·' : sparkChar(v)).codePointAt(0) ?? 0x2588, heatColor(v), DEFAULT_COLOR] as const)
+        paceRow = <Raster key="pace" columns={series.length} rows={1} cells={packCells(cells)} />
       }
-      if (week.length > 0) {
+      body = (
+        <Box flexDirection="column">
+          {head('RITMO DE 5 H', 'hace 5 h → ahora')}
+          {paceRow}
+        </Box>
+      )
+    } else if (tab === 'semana') {
+      // ── Semana: the five-hour window's peak per hour, seven days ──
+      const week = history?.week ?? []
+      const weekDays = history?.weekDays ?? []
+      let weekRows = (
+        <Box flexDirection="column">
+          {week.map((hours, i) => (
+            <Text dimColor>{`${(weekDays[i] ?? '').padEnd(4)}${hours.map(v => (v === null ? '·' : sparkChar(v))).join('')}`}</Text>
+          ))}
+        </Box>
+      )
+      if (e.surface === 'terminal' && week.length > 0) {
+        const { Raster } = $.ui.resolve(e)
+        const cells = week.flat().map(v => [(v === null ? '·' : '█').codePointAt(0) ?? 0x2588, heatColor(v), DEFAULT_COLOR] as const)
         weekRows = (
           <Box flexDirection="row" columnGap={1}>
             <Box flexDirection="column">
@@ -761,135 +883,110 @@ export const register: Register = (on, options) => {
                 <Text dimColor>{day}</Text>
               ))}
             </Box>
-            <Raster key="week" columns={24} rows={week.length} cells={packCells(week.flat().map(v => cell(v, v === null ? '·' : '█')))} />
+            <Raster key="week" columns={24} rows={week.length} cells={packCells(cells)} />
           </Box>
         )
       }
-    }
-
-    const elapsed = Math.max(0, now - reading.startedAt)
-    let turns = 0
-    try {
-      turns = await $.session.turns()
-    } catch {
-      // Left at zero
-    }
-    const isOpus = model !== null && modelFamily(model.model).label === 'OPUS'
-
-    // Compaction: what it would cost, what it saves, and how the cache stands
-    const compact = await read($, COMPACT)
-    const plan = downshiftOf(reading, compact, model, cfg)
-    const isCompactFirst = plan?.isCompactFirst === true
-    const compactRows: string[] = []
-    const autoText =
-      compact?.isAutoCompact === false
-        ? 'autocompact apagado'
-        : compact?.autoCompactAt !== undefined
-          ? `autocompact a ${formatTokens(compact.autoCompactAt)}`
-          : ''
-    if (compact !== null && reading.tokens !== undefined) {
-      const base = Math.min(compact.baseTokens ?? BASE_CAP, BASE_CAP)
-      const summary = compact.summaryTokens
-      const messages = Math.max(0, reading.tokens - base)
-      const ttl = cacheTtlMs(reading)
-      const idle = Math.max(0, now - compact.lastResponseAt)
-      const steps = compact.stepsPerTurn > 0 ? compact.stepsPerTurn : DEFAULT_STEPS_PER_TURN
-      compactRows.push(
-        `contexto ${formatTokens(reading.tokens)} · base ~${formatTokens(base)} · resumen ~${formatTokens(summary)} (${compact.isSummaryMeasured ? 'medido' : 'estimado'})`,
+      body = (
+        <Box flexDirection="column">
+          {head('SEMANA', 'pico de 5 h por hora')}
+          {weekRows}
+          <Text dimColor>{'    0     6     12    18    23'}</Text>
+        </Box>
       )
-      const payback = compactPayback(reading.tokens, messages, summary, pricingOf(model?.model ?? ''), ttl >= HOUR ? 2 : 1.25)
-      if (Number.isFinite(payback.requests)) {
-        compactRows.push(`compactar cuesta ~${formatUsd(payback.costUsd)} · ahorra ~${formatUsd(payback.savingUsd)} por request`)
-        compactRows.push(`se paga en ~${Math.round(payback.requests)} requests · turnos de ~${steps.toFixed(1).replace('.', ',')} requests`)
-      } else {
-        compactRows.push('todavía hay poco para achicar')
+    } else {
+      // ── Resumen: the windows, the compaction numbers and the session ──
+      const elapsed = Math.max(0, now - reading.startedAt)
+      let turns = 0
+      try {
+        turns = await $.session.turns()
+      } catch {
+        // Left at zero
       }
-      compactRows.push(idle > ttl ? `caché frío hace ${formatCountdown(idle)}` : `caché caliente · vence en ${formatCountdown(ttl - idle)}`)
-      if (isOpus && plan !== null) {
+      const compactRows: string[] = []
+      const autoText =
+        compact?.isAutoCompact === false
+          ? 'autocompact apagado'
+          : compact?.autoCompactAt !== undefined
+            ? `autocompact a ${formatTokens(compact.autoCompactAt)}`
+            : ''
+      if (compact !== null && reading.tokens !== undefined) {
+        const base = Math.min(compact.baseTokens ?? BASE_CAP, BASE_CAP)
+        const summary = compact.summaryTokens
+        const messages = Math.max(0, reading.tokens - base)
+        const ttl = cacheTtlMs(reading)
+        const idle = Math.max(0, now - compact.lastResponseAt)
+        const steps = compact.stepsPerTurn > 0 ? compact.stepsPerTurn : DEFAULT_STEPS_PER_TURN
         compactRows.push(
-          `pasar a ${cfg.targetLabel} re-cachea ${formatTokens(reading.tokens)} (~${formatUsd(plan.directUsd)})${isCompactFirst ? ` · compactando antes ~${formatUsd(plan.compactFirstUsd)}` : ''}`,
+          `contexto ${formatTokens(reading.tokens)} · base ~${formatTokens(base)} · resumen ~${formatTokens(summary)} (${compact.isSummaryMeasured ? 'medido' : 'estimado'})`,
         )
+        const payback = compactPayback(reading.tokens, messages, summary, pricingOf(model?.model ?? ''), ttl >= HOUR ? 2 : 1.25)
+        if (Number.isFinite(payback.requests)) {
+          compactRows.push(`compactar cuesta ~${formatUsd(payback.costUsd)} · ahorra ~${formatUsd(payback.savingUsd)} por request`)
+          compactRows.push(`se paga en ~${Math.round(payback.requests)} requests · turnos de ~${steps.toFixed(1).replace('.', ',')} requests`)
+        } else {
+          compactRows.push('todavía hay poco para achicar')
+        }
+        compactRows.push(idle > ttl ? `caché frío hace ${formatCountdown(idle)}` : `caché caliente · vence en ${formatCountdown(ttl - idle)}`)
+        if (isOpus && plan !== null) {
+          compactRows.push(
+            `pasar a ${cfg.targetLabel} re-cachea ${formatTokens(reading.tokens)} (~${formatUsd(plan.directUsd)})${isCompactFirst ? ` · compactando antes ~${formatUsd(plan.compactFirstUsd)}` : ''}`,
+          )
+        }
       }
+      body = (
+        <Box flexDirection="column">
+          {head('VENTANAS DEL PLAN')}
+          {view.windows.length === 0 && <Text dimColor> Sin ventanas: llegan sólo con suscripción, después de la primera respuesta.</Text>}
+          {view.windows.map(w => {
+            const b = bar(w.used / 100, barWidth)
+            const reset =
+              w.resetsAt === undefined
+                ? ''
+                : `↻ ${formatResetAt(w.resetsAt, now)}${w.leftMs === undefined ? '' : ` · en ${formatCountdown(w.leftMs)}`}`
+            const isAhead = w.isTrusted && w.pace !== undefined && w.pace > 1 && w.etaMs !== undefined
+            const pace =
+              w.pace === undefined
+                ? 'ritmo sin dato todavía'
+                : `ritmo ${formatPace(w.pace)} · ${isAhead ? `100 % en ~${formatCountdown(w.etaMs ?? 0)}` : w.isTrusted ? 'llega al reset' : 'poca ventana para proyectar'}`
+            return (
+              <Box flexDirection="column">
+                <Box flexDirection="row">
+                  <Text>{w.short.padEnd(5)}</Text>
+                  <Text {...textProps({ tone: w.level === 'ok' ? 'success' : toneOf(w.level) })}>{b.full}</Text>
+                  <Text dimColor>{b.empty}</Text>
+                  <Text {...textProps({ tone: toneOf(w.level) })}>{`  ${Math.round(w.used)} % ${glyphOf(w.level)}`}</Text>
+                </Box>
+                {reset !== '' && <Text dimColor>{`     ${reset}`}</Text>}
+                <Text {...textProps({ tone: toneOf(w.level) })}>{`     ${pace}`}</Text>
+              </Box>
+            )
+          })}
+          <Text> </Text>
+          {head('COMPACTACIÓN', autoText)}
+          {compactRows.length === 0 && <Text dimColor> Sin cifras todavía: llegan con la primera respuesta.</Text>}
+          {compactRows.map(row => (
+            <Text>{`  ${row}`}</Text>
+          ))}
+          <Text> </Text>
+          {head('SESIÓN')}
+          <Text>{[model?.model ?? 'modelo sin dato', model?.effort, formatCountdown(elapsed), `${turns} turnos`].filter(Boolean).join(' · ')}</Text>
+          {reading.costUsd !== undefined && (
+            <Text dimColor>
+              {`${formatUsd(reading.costUsd)} equivalente API${reading.limits.length > 0 ? ' (con suscripción no se cobra aparte)' : ''}`}
+            </Text>
+          )}
+        </Box>
+      )
     }
 
     return (
       <Box flexDirection="column">
-        {head('CONTEXTO', ctxRight)}
-        <Box flexDirection="row">
-          <Text {...textProps({ tone: ctx.level === 'ok' ? 'success' : toneOf(ctx.level) })}>{ctxBar.full}</Text>
-          <Text dimColor>{ctxBar.empty}</Text>
-        </Box>
-        {(categories ?? []).map(c => (
-          <Text>{`  ${c.name.slice(0, 16).padEnd(16)} ${formatTokens(c.tokens).padStart(5)}  ${bar(c.tokens / biggest, 8).full}`}</Text>
-        ))}
-        {categories === null && <Text dimColor> Sin desglose: lo da /context.</Text>}
+        {tabs}
         <Text> </Text>
-
-        {head('VENTANAS DEL PLAN')}
-        {view.windows.length === 0 && <Text dimColor> Sin ventanas: llegan sólo con suscripción, después de la primera respuesta.</Text>}
-        {view.windows.map(w => {
-          const b = bar(w.used / 100, barWidth)
-          const reset =
-            w.resetsAt === undefined
-              ? ''
-              : `↻ ${formatResetAt(w.resetsAt, now)}${w.leftMs === undefined ? '' : ` · en ${formatCountdown(w.leftMs)}`}`
-          const isAhead = w.isTrusted && w.pace !== undefined && w.pace > 1 && w.etaMs !== undefined
-          const pace =
-            w.pace === undefined
-              ? 'ritmo sin dato todavía'
-              : `ritmo ${formatPace(w.pace)} · ${isAhead ? `100 % en ~${formatCountdown(w.etaMs ?? 0)}` : w.isTrusted ? 'llega al reset' : 'poca ventana para proyectar'}`
-          return (
-            <Box flexDirection="column">
-              <Box flexDirection="row">
-                <Text>{w.short.padEnd(5)}</Text>
-                <Text {...textProps({ tone: w.level === 'ok' ? 'success' : toneOf(w.level) })}>{b.full}</Text>
-                <Text dimColor>{b.empty}</Text>
-                <Text {...textProps({ tone: toneOf(w.level) })}>{`  ${Math.round(w.used)} % ${glyphOf(w.level)}`}</Text>
-              </Box>
-              {reset !== '' && <Text dimColor>{`     ${reset}`}</Text>}
-              <Text {...textProps({ tone: toneOf(w.level) })}>{`     ${pace}`}</Text>
-            </Box>
-          )
-        })}
+        {body}
         <Text> </Text>
-
-        {head('COMPACTACIÓN', autoText)}
-        {compactRows.length === 0 && <Text dimColor> Sin cifras todavía: llegan con la primera respuesta.</Text>}
-        {compactRows.map(row => (
-          <Text>{`  ${row}`}</Text>
-        ))}
-        <Text> </Text>
-
-        {head('RITMO DE 5 H', 'hace 5 h → ahora')}
-        {paceRow}
-        <Text> </Text>
-
-        {head('SEMANA', 'pico de 5 h por hora')}
-        {weekRows}
-        <Text dimColor>{'    0     6     12    18    23'}</Text>
-        <Text> </Text>
-
-        {head('SESIÓN')}
-        <Text>{[model?.model ?? 'modelo sin dato', model?.effort, formatCountdown(elapsed), `${turns} turnos`].filter(Boolean).join(' · ')}</Text>
-        {reading.costUsd !== undefined && (
-          <Text dimColor>
-            {`USD ${reading.costUsd.toFixed(2).replace('.', ',')} equivalente API${reading.limits.length > 0 ? ' (con suscripción no se cobra aparte)' : ''}`}
-          </Text>
-        )}
-        <Text> </Text>
-        <Box flexDirection="row" columnGap={3} flexWrap="wrap">
-          <Button key="compact" label="Compactar ahora" hotkey="1" plain onPress={() => compactNow($)} />
-          {isOpus && (
-            <Button
-              key="downshift"
-              label={isCompactFirst ? `Compactar y pasar a ${cfg.targetLabel}` : `Pasar a ${cfg.targetLabel}`}
-              hotkey="2"
-              plain
-              onPress={() => (isCompactFirst ? compactThenDownshift($, cfg) : downshift($, cfg))}
-            />
-          )}
-          <Button key="close" label="Cerrar" hotkey="3" plain onPress={() => closePane($)} />
-        </Box>
+        {actions}
       </Box>
     )
   })

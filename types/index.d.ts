@@ -50,9 +50,14 @@ export type CuotaTurn = { turnId: string; steps: number; costUsd: number; readTo
 /** A finished turn, matched to its "Worked for" line by duration. */
 export type CuotaTurnDone = { durationMs: number; steps: number; costUsd: number; readTokens: number; sentTokens: number }
 
+/** The line's design as the Design tab saves it (hooks/line.ts validates it as a Layout). */
+export type CuotaLayout = { order: string[]; hidden: string[]; style: string; configStyle?: string }
+
 declare module 'claude-code' {
   interface PluginState {
     cuota: {
+      layout: CuotaLayout | null
+      paneTab: string
       turn: CuotaTurn | null
       turns: CuotaTurnDone[]
       compact: CuotaCompact | null
