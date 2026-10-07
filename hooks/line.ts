@@ -8,9 +8,11 @@ import {
   formatCountdown,
   formatPace,
   formatResetAt,
+  formatTokens,
   formatUsd,
   glyphOf,
   modelFamily,
+  pricingOf,
   spark,
   toneOf,
 } from './math'
@@ -231,10 +233,89 @@ export function lineRows(input: LineInput, layout: Layout, columns: number): Pie
       const whole = SEGMENT_DROP[id]
       const tagged = pieces.map(piece => ({ ...piece, seg: id, drop: Math.max(piece.drop ?? 0, whole) }))
       // The separator goes with the segment after it, so dropping a segment never leaves a stray one
-      if (row.length > 0) row.push({ text: SEPARATORS[style], dim: style === 'compacta', seg: id, drop: whole })
+      if (row.length > 0) row.push({ text: SEPARATORS[style], dim: style === 'compacta', seg: id, drop: whole, isSeparator: true })
       row.push(...(style === 'pildoras' ? pill(tagged, segmentLevel(id, input.view), id, whole) : tagged))
     }
     if (row.length > 0) rows.push(fitPieces(row, columns))
   }
   return rows
+}
+
+// ── Hover cards ───────────────────────────────────────────────────────
+
+const CONTEXT_ADVICE: Record<Level, string> = {
+  ok: 'en calma',
+  warn: 'conviene compactar pronto',
+  crit: 'compactá antes de que lo haga el motor',
+}
+
+/** The card a segment shows while the pointer is over it, one piece per line, the title first. */
+export function cardLines(id: SegmentId, input: LineInput): Piece[] {
+  const { view, model, cache } = input
+  const title = (text: string): Piece => ({ text, bold: true })
+  switch (id) {
+    case 'model': {
+      if (model === null) return [title('Modelo'), { text: 'sin dato todavía', dim: true }]
+      const price = pricingOf(model.model)
+      return [
+        title('Modelo'),
+        { text: `${model.model} · effort ${model.effort ?? '—'}` },
+        { text: `input US$${String(price.input).replace('.', ',')} · lectura de caché ${formatUsd(price.read)} por MTok`, dim: true },
+        model.isFallback ? { text: 'el último request salió por un modelo de fallback', tone: 'warning' } : { text: 'sin fallback', dim: true },
+      ]
+    }
+    case 'ctx': {
+      const context = view?.context
+      if (context?.percent === undefined) return [title('Contexto'), { text: 'sin lectura todavía', dim: true }]
+      return [
+        title('Contexto'),
+        { text: `${context.tokens === undefined ? '' : `${formatTokens(context.tokens)} de `}${formatTokens(context.window)} · ${Math.round(context.percent)} %` },
+        { text: CONTEXT_ADVICE[context.level], tone: toneOf(context.level) },
+        { text: 'detalle en /cuota → Contexto', dim: true },
+      ]
+    }
+    case 'five':
+    case 'seven': {
+      const w = view === null ? undefined : windowOf(view, id === 'five' ? 'five_hour' : 'seven_day')
+      const name = id === 'five' ? 'Ventana de 5 h' : 'Ventana de 7 d'
+      if (w === undefined) return [title(name), { text: 'sin lectura todavía', dim: true }]
+      const isAhead = w.isTrusted && w.pace !== undefined && w.pace > 1 && w.etaMs !== undefined
+      const lines: Piece[] = [
+        title(name),
+        { text: `${Math.round(w.used)} % usado${w.elapsed === undefined ? '' : ` · ${Math.round(w.elapsed * 100)} % de la ${id === 'five' ? 'ventana' : 'semana'}`}` },
+        w.pace === undefined
+          ? { text: 'ritmo sin dato todavía', dim: true }
+          : {
+              text: `ritmo ${formatPace(w.pace)} · ${isAhead ? `100 % en ~${formatCountdown(w.etaMs ?? 0)}` : w.isTrusted ? 'llega al reset' : 'poca ventana para proyectar'}`,
+              tone: toneOf(w.level),
+            },
+      ]
+      if (w.resetsAt !== undefined) {
+        lines.push({ text: `reset ${formatResetAt(w.resetsAt, input.now)}${w.leftMs === undefined ? '' : ` · en ${formatCountdown(w.leftMs)}`}`, dim: true })
+      }
+      const series = input.history?.fiveSeries ?? []
+      if (id === 'five' && series.filter(v => v !== null).length >= 2) lines.push({ text: `${spark(series, 20)}  últimas 5 h`, dim: true })
+      return lines
+    }
+    case 'cache': {
+      if (cache === null) return [title('Caché del prompt'), { text: 'todavía no hay nada cacheado', dim: true }]
+      return cache.isWarm
+        ? [
+            title('Caché del prompt'),
+            { text: `caliente · vence en ${formatCountdown(cache.leftMs)}`, tone: 'suggestion' },
+            { text: 'el próximo request lee el contexto del caché', dim: true },
+          ]
+        : [
+            title('Caché del prompt'),
+            { text: `frío hace ${formatCountdown(cache.idleMs)}`, tone: 'warning' },
+            { text: 'el próximo request vuelve a escribir todo el contexto', dim: true },
+          ]
+    }
+    case 'cost': {
+      if (input.costUsd === undefined) return [title('Costo de la sesión'), { text: 'sin dato todavía', dim: true }]
+      const lines: Piece[] = [title('Costo de la sesión'), { text: `${formatUsd(input.costUsd)} equivalente API` }]
+      if ((view?.windows.length ?? 0) > 0) lines.push({ text: 'con suscripción no se cobra aparte', dim: true })
+      return lines
+    }
+  }
 }

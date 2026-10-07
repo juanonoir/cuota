@@ -410,3 +410,24 @@ describe('panel con gráficos', () => {
     await ui.unmount()
   })
 })
+
+describe('tarjetas al pasar el mouse', () => {
+  test('en pantalla completa cada segmento trae su tarjeta, oculta hasta pasar el mouse', async ($, on) => {
+    await start($, on, usage(31, [five(42, 134), seven(29)]))
+    const line = await $.ui.mount({ ...HINT, surface: 'terminal', viewport: { columns: 150, rows: 40, isFullscreen: true } })
+    expect(await line.find({ key: 'seg-five' })).toBeDefined()
+    expect(await line.find({ text: /ritmo 0,76× · llega al reset/ })).toBeDefined()
+    const cards = (await line.findAll({ type: 'Box' })).filter(found => found.props.position === 'absolute')
+    expect(cards.length).toBeGreaterThan(3)
+    expect(cards.every(found => found.props.display === 'none')).toBe(true)
+    await line.unmount()
+  })
+
+  test('en la pantalla principal no hay tarjetas, porque no se verían', async ($, on) => {
+    await start($, on, usage(31, [five(42, 134), seven(29)]))
+    const line = await $.ui.mount({ ...HINT, surface: 'terminal', viewport: { columns: 150, rows: 40, isFullscreen: false } })
+    expect(await line.find({ text: /5h 42%/ })).toBeDefined()
+    expect(await line.find({ text: /llega al reset/ })).toBeUndefined()
+    await line.unmount()
+  })
+})

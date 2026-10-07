@@ -3,6 +3,7 @@ import { describe, expect, test } from 'claude-code/testing'
 import {
   DEFAULT_LAYOUT,
   asLayout,
+  cardLines,
   lineRows,
   moveSegment,
   shiftStyle,
@@ -117,5 +118,33 @@ describe('la línea', () => {
     expect(row).not.toContain('US$')
     expect(row).not.toContain('caché')
     expect(row?.endsWith('·  ')).toBe(false)
+  })
+})
+
+describe('tarjetas al pasar el mouse', () => {
+  const lines = (id: Parameters<typeof cardLines>[0], percent = 31) => cardLines(id, input(percent)).map(piece => piece.text)
+
+  test('la ventana de 5 h: usado contra transcurrido, ritmo y reset', () => {
+    expect(lines('five')).toEqual(['Ventana de 5 h', '42 % usado · 55 % de la ventana', 'ritmo 0,76× · llega al reset', 'reset 16:19 · en 2h14'])
+  })
+
+  test('el modelo con sus precios', () => {
+    expect(lines('model')).toEqual(['Modelo', 'claude-opus-5-5 · effort xhigh', 'input US$4 · lectura de caché US$0,20 por MTok', 'sin fallback'])
+  })
+
+  test('el contexto dice qué hacer según cómo está', () => {
+    expect(lines('ctx')[2]).toBe('en calma')
+    expect(lines('ctx', 92)[2]).toBe('compactá antes de que lo haga el motor')
+  })
+
+  test('el caché y el costo', () => {
+    expect(lines('cache')).toEqual(['Caché del prompt', 'caliente · vence en 41 min', 'el próximo request lee el contexto del caché'])
+    expect(lines('cost')).toEqual(['Costo de la sesión', 'US$12,40 equivalente API', 'con suscripción no se cobra aparte'])
+  })
+
+  test('los separadores quedan marcados, fuera del área de cada segmento', () => {
+    const [row] = lineRows(input(), DEFAULT_LAYOUT, 160)
+    expect(row?.filter(piece => piece.isSeparator).every(piece => piece.text === '  ·  ')).toBe(true)
+    expect(row?.filter(piece => piece.isSeparator)).toHaveLength(4)
   })
 })

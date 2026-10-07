@@ -61,9 +61,9 @@ import {
   weekGrid,
   weekKeys,
 } from './math'
-import type { Alert, CellTone, CompactAdvice, DayRecord, Thresholds, Tone, WindowView } from './math'
-import { SEGMENT_NAMES, STYLE_NAMES, asLayout, lineRows, moveSegment, shiftStyle, toggleSegment, withConfigStyle } from './line'
-import type { CacheState, Layout, LineInput } from './line'
+import type { Alert, CellTone, CompactAdvice, DayRecord, Piece, Thresholds, Tone, WindowView } from './math'
+import { SEGMENT_NAMES, STYLE_NAMES, asLayout, cardLines, lineRows, moveSegment, shiftStyle, toggleSegment, withConfigStyle } from './line'
+import type { CacheState, Layout, LineInput, SegmentId } from './line'
 
 type $ = EngineInterface
 
@@ -718,16 +718,63 @@ export const register: Register = (on, options) => {
     if (reading === null && model === null) return theirs ?? <Box />
 
     const columns = Math.max(20, (e.viewport?.columns ?? 100) - 2)
-    const rows = lineRows(lineInputOf(reading, model, history, compact, now, cfg), layout, columns)
+    const input = lineInputOf(reading, model, history, compact, now, cfg)
+    const rows = lineRows(input, layout, columns)
+    // Cards only where the pointer reaches Claude Code: the fullscreen terminal, or a surface drawing its own tree
+    const hasCards = e.surface !== 'terminal' || e.viewport?.isFullscreen === true
+
+    // Each segment in a keyed Box, so the pointer over it reveals its card; separators stay outside
+    const drawRow = (row: Piece[]) => {
+      const out = []
+      let i = 0
+      while (i < row.length) {
+        const piece = row[i]
+        if (piece === undefined) break
+        if (piece.isSeparator === true || piece.seg === undefined) {
+          out.push(<Text {...textProps(piece)}>{piece.text}</Text>)
+          i += 1
+          continue
+        }
+        const seg = piece.seg as SegmentId
+        const body: Piece[] = []
+        while (i < row.length && row[i]?.seg === seg && row[i]?.isSeparator !== true) {
+          body.push(row[i] as Piece)
+          i += 1
+        }
+        const lines = hasCards ? cardLines(seg, input) : []
+        // Every line padded to one width, so the card covers what lies beneath it
+        const width = Math.max(0, ...lines.map(line => [...line.text].length))
+        out.push(
+          <Box key={`seg-${seg}`} flexDirection="row">
+            {body.map(part => (
+              <Text {...textProps(part)}>{part.text}</Text>
+            ))}
+            {lines.length > 0 && (
+              <Box
+                position="absolute"
+                top={-(lines.length + 2)}
+                left={0}
+                display="none"
+                hover={{ display: 'flex' }}
+                flexDirection="column"
+                borderStyle="round"
+                paddingX={1}
+              >
+                {lines.map(line => (
+                  <Text {...textProps(line)}>{line.text.padEnd(width)}</Text>
+                ))}
+              </Box>
+            )}
+          </Box>,
+        )
+      }
+      return out
+    }
 
     return (
       <Box flexDirection="column">
         {rows.map(row => (
-          <Box flexDirection="row">
-            {row.map(piece => (
-              <Text {...textProps(piece)}>{piece.text}</Text>
-            ))}
-          </Box>
+          <Box flexDirection="row">{drawRow(row)}</Box>
         ))}
         {theirs}
       </Box>

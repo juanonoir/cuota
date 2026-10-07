@@ -182,7 +182,17 @@ function peakOf(values: readonly (number | null)[]): number | null {
  * A run of text the line draws; `drop` above 0 marks it optional, the highest dropped first.
  * `seg` names the segment it belongs to (the hover card groups by it) and `bg` a background (the pill style).
  */
-export type Piece = { text: string; tone?: Tone; bold?: boolean; dim?: boolean; drop?: number; seg?: string; bg?: string }
+export type Piece = {
+  text: string
+  tone?: Tone
+  bold?: boolean
+  dim?: boolean
+  drop?: number
+  seg?: string
+  bg?: string
+  /** The gap between two segments: drawn outside either one's hover area. */
+  isSeparator?: boolean
+}
 
 export function widthOf(pieces: readonly Piece[]): number {
   return pieces.reduce((n, p) => n + [...p.text].length, 0)
