@@ -350,9 +350,19 @@ async function onTurnComplete($: $, turnId: string, durationMs: number) {
   )
 }
 
-/** A real compaction tells how big a summary comes out and what stays behind; both calibrate the advice. */
-async function onCompacted($: $, result: SessionCompactResult) {
+/**
+ * A real compaction tells how big a summary comes out and what stays behind; both calibrate the advice.
+ * The engine reports no context until the next response, so the size it compacted to stands in meanwhile:
+ * the line and the band show what is left, not what was there.
+ */
+async function onCompacted($: $, cfg: Config, result: SessionCompactResult) {
   if (result.skip !== undefined) return
+  const after = result.tokensAfter
+  if (after !== undefined) {
+    await update($, READING, prev =>
+      prev === null || prev.window <= 0 ? prev : { ...prev, tokens: after, percent: Math.round((after / prev.window) * 100) },
+    )
+  }
   const now = await $.clock.now()
   const prev = await read($, COMPACT)
   const compact = prev ?? freshCompact(now, undefined)
@@ -369,6 +379,7 @@ async function onCompacted($: $, result: SessionCompactResult) {
   }))
   if (sample !== undefined && sample > 0) await $.store.set('summary', summary)
   await update($, DISMISSED, list => (list ?? []).filter(id => !id.startsWith('compact:')))
+  await evaluate($, cfg)
 }
 
 function adviceOf(reading: CuotaReading | null, compact: CuotaCompact | null, model: CuotaModel | null, now: number, cfg: Config): CompactAdvice | null {
@@ -452,13 +463,27 @@ async function closePane($: $) {
   await $.ui.close({ id: PANE })
 }
 
-async function compactNow($: $) {
+/**
+ * Compacts and takes the result in: a compaction this mod starts skips the mod's own `session.compact`
+ * hook (the call runs through every hook but the caller's), so the call's result is read here.
+ */
+async function compactNow($: $, cfg: Config) {
   $.ui.toast('Compactando la conversación…')
+  let result: SessionCompactResult
   try {
-    const result = await $.session.compact()
-    if ('skip' in result && typeof result.skip === 'string') $.ui.toast(`No se compactó: ${result.skip}`)
+    result = await $.session.compact()
   } catch (error) {
     $.ui.toast(`No se pudo compactar: ${error instanceof Error ? error.message : String(error)}`)
+    return
+  }
+  if (result.skip !== undefined) {
+    $.ui.toast(`No se compactó: ${result.skip}`)
+    return
+  }
+  try {
+    await onCompacted($, cfg, result)
+  } catch {
+    // The compaction stands either way
   }
 }
 
@@ -488,8 +513,19 @@ async function downshift($: $, cfg: Config) {
 
 /** Switching model throws the prompt cache away: compacting first leaves the new model only a summary to re-cache. */
 async function compactThenDownshift($: $, cfg: Config) {
-  await compactNow($)
+  await compactNow($, cfg)
   await downshift($, cfg)
+}
+
+/**
+ * What a Compactar button runs. A press has ten seconds of its own and a compaction takes a minute or
+ * more, so the press only sets it on the clock, which runs it outside the press; with `isDownshift`,
+ * the model switch follows it.
+ */
+function scheduleCompact($: $, cfg: Config, isDownshift = false) {
+  $.clock.after(0, () => {
+    void (isDownshift ? compactThenDownshift($, cfg) : compactNow($, cfg))
+  })
 }
 
 async function hide($: $, alert: Alert) {
@@ -582,7 +618,7 @@ export const register: Register = (on, options) => {
     const result = await next(e)
     if (e.agentId === undefined) {
       try {
-        await onCompacted($, result)
+        await onCompacted($, cfg, result)
       } catch {
         // The compaction stands either way
       }
@@ -680,7 +716,7 @@ export const register: Register = (on, options) => {
               {glyphOf(alert.level)} {alert.text}
             </Text>
             {(alert.unit === 'ctx' || alert.unit === 'compact') && (
-              <Button key="compact" label="Compactar" hotkey="1" plain onPress={() => compactNow($)} />
+              <Button key="compact" label="Compactar" hotkey="1" plain onPress={() => scheduleCompact($, cfg)} />
             )}
             {alert.unit === 'five_hour' && isOpus && (
               <Button
@@ -688,7 +724,7 @@ export const register: Register = (on, options) => {
                 label={isCompactFirst ? `Compactar y pasar a ${cfg.targetLabel}` : `Pasar a ${cfg.targetLabel}`}
                 hotkey="1"
                 plain
-                onPress={() => (isCompactFirst ? compactThenDownshift($, cfg) : downshift($, cfg))}
+                onPress={() => (isCompactFirst ? scheduleCompact($, cfg, true) : downshift($, cfg))}
               />
             )}
             <Button key="open" label={alert.unit === 'ctx' ? 'Desglose' : 'Ver /cuota'} hotkey="2" plain onPress={() => openPane($)} />
@@ -814,14 +850,14 @@ export const register: Register = (on, options) => {
 
     const actions = (
       <Box flexDirection="row" columnGap={3} flexWrap="wrap">
-        <Button key="compact" label="Compactar ahora" hotkey="c" plain onPress={() => compactNow($)} />
+        <Button key="compact" label="Compactar ahora" hotkey="c" plain onPress={() => scheduleCompact($, cfg)} />
         {isOpus && (
           <Button
             key="downshift"
             label={isCompactFirst ? `Compactar y pasar a ${cfg.targetLabel}` : `Pasar a ${cfg.targetLabel}`}
             hotkey="m"
             plain
-            onPress={() => (isCompactFirst ? compactThenDownshift($, cfg) : downshift($, cfg))}
+            onPress={() => (isCompactFirst ? scheduleCompact($, cfg, true) : downshift($, cfg))}
           />
         )}
         <Button key="close" label="Cerrar" hotkey="q" plain onPress={() => closePane($)} />

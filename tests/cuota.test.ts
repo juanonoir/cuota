@@ -70,6 +70,7 @@ async function start(
   on: On,
   figures: SessionUsage,
   compaction: SessionCompactResult = { skip: 'probado' },
+  compactMs = 0,
 ): Promise<Seen> {
   const clock = mock.clock(on, { now: NOW })
   const seen: Seen = { toasts: [], statuses: [], opened: [], fills: [], compacted: 0, clock }
@@ -96,8 +97,10 @@ async function start(
   on('ui.close', () => ({ value: undefined }))
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('session.measure', ($, e) => ({ changed: e.changed }))
-  on('session.compact', () => {
+  // A real compaction takes a minute or more: `compactMs` makes this one answer that late
+  on('session.compact', async () => {
     seen.compacted += 1
+    if (compactMs > 0) await clock.sleep(compactMs)
     return compaction
   })
   on('prompt.fill', ($, e) => {
@@ -157,6 +160,14 @@ const BREAKDOWN: SessionContextBreakdown = {
 
 const STEP_USAGE = { input_tokens: 2_000, output_tokens: 1_000, cache_read_input_tokens: 100_000, cache_creation_input_tokens: 5_000 }
 
+/** A compaction of 400k that leaves 67k, with a summary of 7k. */
+const COMPACTED: SessionCompactResult = {
+  messages: [{ role: 'user', text: 'Resumen de la conversación hasta acá.', toolUses: [] }],
+  tokensBefore: 400_000,
+  tokensAfter: 67_000,
+  usage: { input_tokens: 0, output_tokens: 7_000, cache_read_input_tokens: 400_000, cache_creation_input_tokens: 0 },
+}
+
 /** Runs one main-thread turn of `steps` model requests that lasts `durationMs`. */
 async function runTurn($: Engine, turnId: string, steps: number, durationMs: number) {
   await $.turn.start({ text: 'Ejecutar SCAN de ApiSupport', turnId })
@@ -191,7 +202,9 @@ describe('banda', () => {
     const seen = await start($, on, usage(78, [five(46, 122)]))
     const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
     expect(await ui.find({ text: /Contexto 78 %/ })).toBeDefined()
+    // The press sets the compaction on the clock, which runs it once the press is done
     await ui.press({ key: 'compact' })
+    await seen.clock.settle()
     expect(seen.compacted).toBe(1)
     await ui.unmount()
   })
@@ -251,6 +264,7 @@ describe('compactación', () => {
     const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
     expect(await ui.find({ text: /se paga en ~5 requests/ })).toBeDefined()
     await ui.press({ key: 'compact' })
+    await seen.clock.settle()
     expect(seen.compacted).toBe(1)
     await ui.unmount()
   })
@@ -261,6 +275,7 @@ describe('compactación', () => {
     const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
     expect(await ui.find({ text: /Compactar y pasar a Sonnet/ })).toBeDefined()
     await ui.press({ key: 'downshift' })
+    await seen.clock.settle()
     expect(seen.compacted).toBe(1)
     expect(seen.fills).toEqual(['/model sonnet'])
     await ui.unmount()
@@ -288,14 +303,51 @@ describe('compactación', () => {
     await after.unmount()
   })
 
-  test('una compactación real calibra el tamaño del resumen', async ($, on) => {
-    const summary = [{ role: 'user' as const, text: 'Resumen de la conversación hasta acá.', toolUses: [] }]
-    await start($, on, big(400_000, [five(30, 200)]), {
-      messages: summary,
-      tokensBefore: 400_000,
-      tokensAfter: 67_000,
-      usage: { input_tokens: 0, output_tokens: 7_000, cache_read_input_tokens: 400_000, cache_creation_input_tokens: 0 },
+  test('el botón Compactar vuelve al instante aunque compactar tarde un minuto y medio', async ($, on) => {
+    // 840k tardaron 98 s en compactarse, y una pulsación tiene 10 s propios
+    const seen = await start($, on, big(400_000, [five(30, 200)]), COMPACTED, 98_000)
+    const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+    let isPressDone = false
+    const press = ui.press({ key: 'compact' }).then(() => {
+      isPressDone = true
     })
+    await seen.clock.settle()
+    expect(isPressDone).toBe(true)
+    expect(seen.compacted).toBe(1)
+    expect(seen.toasts).toContain('Compactando la conversación…')
+    await seen.clock.advance(98_000)
+    await press
+    await ui.unmount()
+  })
+
+  test('después de compactar, la línea y la banda muestran el contexto que quedó', async ($, on) => {
+    const seen = await start($, on, big(400_000, [five(30, 200)]), COMPACTED)
+    const band = await $.ui.mount({ ...BAND, surface: 'terminal' })
+    await band.press({ key: 'compact' })
+    await seen.clock.settle()
+    expect(await band.find({ key: 'compact' })).toBeUndefined()
+    await band.unmount()
+
+    const line = await $.ui.mount({ ...HINT, surface: 'terminal' })
+    expect(await line.find({ text: /ctx 7%/ })).toBeDefined()
+    await line.unmount()
+  })
+
+  test('compactar desde el botón también calibra el resumen', async ($, on) => {
+    // The mod's own compaction skips the mod's session.compact hook: the button reads the result itself
+    const seen = await start($, on, big(400_000, [five(30, 200)]), COMPACTED)
+    const band = await $.ui.mount({ ...BAND, surface: 'terminal' })
+    await band.press({ key: 'compact' })
+    await seen.clock.settle()
+    await band.unmount()
+    await $.command.run({ command: 'cuota', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 150 } })
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    expect(await ui.find({ text: /resumen ~7k \(medido\)/ })).toBeDefined()
+    await ui.unmount()
+  })
+
+  test('una compactación real calibra el tamaño del resumen', async ($, on) => {
+    await start($, on, big(400_000, [five(30, 200)]), COMPACTED)
     await $.session.compact({
       trigger: 'manual',
       messages: [

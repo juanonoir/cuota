@@ -126,11 +126,17 @@ claude --plugin-dir .
 
 En los tests nada responde por debajo de los plugins: el helper `start()` contesta cada llamada del motor. Un hook sobre una llamada de `$` devuelve `{ value }`, un evento devuelve su resultado, y un test no puede registrar dos veces el mismo evento.
 
-Una regla del motor que conviene saber: **`$` sólo puede pasarse a funciones declaradas en el nivel superior del archivo**. `validate` rechaza un helper que sea un closure dentro de `register`.
+Tres reglas del motor que conviene saber:
+
+- **`$` sólo puede pasarse a funciones declaradas en el nivel superior del archivo.** `validate` rechaza un helper que sea un closure dentro de `register`.
+- **Un botón tiene 10 segundos.** Si su `onPress` espera algo más largo, como una compactación, que tarda un minuto o más, el motor lo corta y muestra `ui.press hook skipped: ran past its 10s budget`. Por eso «Compactar» sólo agenda la compactación con `$.clock.after` y vuelve enseguida.
+- **Una compactación que pide el mod no pasa por el hook `session.compact` del propio mod.** `$.session.compact()` recorre todos los hooks menos los de quien llama, así que el botón lee el resultado de la llamada y calibra con eso. Las compactaciones de `/compact` y las automáticas sí pasan por el hook.
 
 ## Límites
 
 - Las ventanas se actualizan con cada respuesta de la API. Sin turnos, el % no se mueve; la cuenta regresiva sí.
+- Después de compactar, el motor no informa el contexto hasta la próxima respuesta. Mientras tanto la línea muestra el tamaño que el motor dice que quedó, y la respuesta siguiente lo corrige con la medición real, que suele ser algo mayor porque el motor vuelve a adjuntar archivos y skills.
+- Un cambio de `autoCompactEnabled` o `autoCompactWindow` en `settings.json` rige para las sesiones que se abren después. Las que ya estaban abiertas siguen con la configuración con la que arrancaron.
 - Fuera de suscripción no hay ventanas, y la línea muestra sólo el modelo y el contexto.
 - Los mods no se dibujan en el chat de VS Code ni con `claude -p`, y las sesiones en background tampoco dibujan.
 - La API de mods está en early access: si una versión nueva de Claude Code rompe algo, `claude plugin validate .` dice qué.
