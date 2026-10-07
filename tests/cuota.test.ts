@@ -37,6 +37,11 @@ const BAND = {
   component: 'AbovePrompt',
   props: { hasSurvey: false, isWorking: false, maxRows: 6, bodyColumns: 110, ...SITE },
 } as const
+const HINT = {
+  plugin: 'cuota',
+  component: 'PromptHint',
+  props: { isDraft: false, isWorking: false, hint: '? for shortcuts' },
+} as const
 const PANE = {
   plugin: 'cuota',
   component: 'Pane',
@@ -101,16 +106,21 @@ async function start(
 }
 
 describe('banda', () => {
-  test('en calma: la línea fija sin botones, en terminal y desktop', async ($, on) => {
+  test('en calma: la línea fija va debajo del prompt y la banda queda vacía, en terminal y desktop', async ($, on) => {
     await start($, on, usage(31, [five(42, 134), seven(29)]))
     for (const surface of ['terminal', 'desktop'] as const) {
-      const ui = await $.ui.mount({ ...BAND, surface })
-      expect(await ui.find({ text: /OPUS/ })).toBeDefined()
-      expect(await ui.find({ text: /ctx 31%/ })).toBeDefined()
-      expect(await ui.find({ text: /5h 42%/ })).toBeDefined()
-      expect(await ui.find({ text: /7d 29%/ })).toBeDefined()
-      expect(await ui.find({ type: 'Button' })).toBeUndefined()
-      await ui.unmount()
+      const line = await $.ui.mount({ ...HINT, surface })
+      expect(await line.find({ text: /OPUS/ })).toBeDefined()
+      expect(await line.find({ text: /ctx 31%/ })).toBeDefined()
+      expect(await line.find({ text: /5h 42%/ })).toBeDefined()
+      expect(await line.find({ text: /↻ 2h14/ })).toBeDefined()
+      expect(await line.find({ text: /7d 29%/ })).toBeDefined()
+      await line.unmount()
+
+      const band = await $.ui.mount({ ...BAND, surface })
+      expect(await band.find({ text: /ctx 31%/ })).toBeUndefined()
+      expect(await band.find({ type: 'Button' })).toBeUndefined()
+      await band.unmount()
     }
   })
 

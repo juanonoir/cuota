@@ -1,10 +1,14 @@
 # cuota
 
-Un mod de Claude Code que deja siempre a la vista, arriba del prompt, el modelo, el contexto y las ventanas de 5 h y 7 d del plan. Cuando algo cruza un umbral, agrega una fila con la acción a mano.
+Un mod de Claude Code que deja siempre a la vista, en un renglón propio debajo del prompt, el modelo, el contexto y las ventanas de 5 h y 7 d del plan. Cuando algo cruza un umbral, agrega arriba del prompt una fila con la acción a mano.
 
 ```
 ■ 5 h al 86 % · a este ritmo llega al 100 % en ~38 min; el reset es en 1h05   1: Pasar a Sonnet  2: Ver /cuota  3: Ocultar
-OPUS xhigh  ·  ctx 52% █████▏░░░░  ·  ■ 5h 86% ↻1h05 ▂▃▄▅▆▇  ·  7d 33% ↻sáb 11:00
+────────────────────────────────────────────────────────────────────────────
+> _
+────────────────────────────────────────────────────────────────────────────
+OPUS xhigh  ·  ctx 52% █████▏░░░░  ·  ■ 5h 86%  ↻ 1h05 ▂▃▄▅▆▇  ·  7d 33%  ↻ sáb 11:00
+? for shortcuts
 ```
 
 Requiere Claude Code 2.1.287 o posterior. Probado en la 2.1.292.
@@ -17,20 +21,20 @@ En una terminal de Claude Code:
 /plugin install cuota --marketplace juanonoir/cuota
 ```
 
-Respondé `y` para agregar el marketplace y elegí el alcance de usuario. Si tenías un `statusLine` propio en `settings.json`, la banda lo reemplaza: podés sacarlo.
+Respondé `y` para agregar el marketplace y elegí el alcance de usuario. Si tenías un `statusLine` propio, la línea fija lo reemplaza: sacalo de todos los `settings.json` que lo definan, incluido el `.claude/settings.json` de la carpeta desde donde abrís `claude`, que se lee como configuración del proyecto.
 
 ## Qué muestra
 
-**La línea fija** (siempre):
+**La línea fija** (siempre, en un renglón propio debajo del prompt, sobre la línea de pistas de Claude Code):
 
 - El modelo, con un semáforo por costo: Opus rojo, Sonnet amarillo, Haiku verde. También el effort, y `fallback` si el último request salió por otro modelo.
 - El contexto en %, con una barra.
 - La ventana de 5 h: %, cuenta regresiva al reset y sparkline de las últimas 5 h.
 - La ventana de 7 d: % y día y hora del reset.
 
-Si la banda es angosta, se descartan primero el sparkline, las barras y el effort.
+Si la terminal es angosta, se descartan primero el sparkline, las barras y el effort.
 
-**La fila de alerta** (sólo cuando hace falta):
+**La fila de alerta** (arriba del prompt, sólo cuando hace falta; los dígitos funcionan escribiéndolos solos en el prompt vacío):
 
 | Qué | Cuándo | Botones |
 | --- | --- | --- |
@@ -38,8 +42,6 @@ Si la banda es angosta, se descartan primero el sparkline, las barras y el effor
 | Compactación | ▲ si compactar se paga en pocos turnos, o si el caché está frío | `1` Compactar · `2` Ver /cuota · `3` Ocultar |
 | Ventana de 5 h | ▲ si va por encima del ritmo parejo; ■ si además pasó el 50 %, o desde 80 % | `1` Pasar a Sonnet (sólo con Opus) · `2` Ver /cuota · `3` Ocultar |
 | Ventana de 7 d | Igual, con piso en 90 % | `2` Ver /cuota · `3` Ocultar |
-
-Los dígitos funcionan escribiéndolos solos en el prompt vacío.
 
 **Además:**
 

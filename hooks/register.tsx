@@ -470,11 +470,11 @@ function linePieces(view: View | null, model: CuotaModel | null, history: CuotaH
     const glyph = glyphOf(w.level)
     pieces.push({ text: `${glyph === '' ? '' : `${glyph} `}${w.short} ${Math.round(w.used)}%`, tone: toneOf(w.level) })
     if (w.kind === 'five_hour') {
-      if (w.leftMs !== undefined) pieces.push({ text: ` ↻${formatCountdown(w.leftMs)}`, dim: true, drop: 2 })
+      if (w.leftMs !== undefined) pieces.push({ text: `  ↻ ${formatCountdown(w.leftMs)}`, dim: true, drop: 2 })
       const series = history?.fiveSeries ?? []
       if (series.filter(v => v !== null).length >= 2) pieces.push({ text: ` ${spark(series, 10)}`, dim: true, drop: 6 })
     } else if (w.resetsAt !== undefined) {
-      pieces.push({ text: ` ↻${formatResetAt(w.resetsAt, now)}`, dim: true, drop: 3 })
+      pieces.push({ text: `  ↻ ${formatResetAt(w.resetsAt, now)}`, dim: true, drop: 3 })
     }
   }
   return pieces
@@ -542,21 +542,18 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
-  // The band: whatever other mods draw, the alert row when there is one, and the fixed line nearest the prompt
+  // The band above the prompt: whatever other mods draw, and the alert row only while there is something to act on
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey) return next(e)
 
     const { Box, Text, Button } = $.ui.resolve(e)
     const reading = await read($, READING)
     const model = await read($, MODEL)
-    const history = await read($, HISTORY)
     const dismissed = await read($, DISMISSED)
     const compact = await read($, COMPACT)
     const now = await nowOf($)
-    const columns = Math.max(20, e.props.bodyColumns)
 
     const view = reading === null ? null : buildView(reading, now, cfg.t)
-    const pieces = fitPieces(linePieces(view, model, history, now), columns)
     const advice = adviceOf(reading, compact, model, now, cfg)
     const extras = advice === null || compact === null ? [] : [compactAlert(advice, compact.lastResponseAt)]
     const alert = view === null ? null : pickAlert(view, dismissed, extras)
@@ -569,6 +566,7 @@ export const register: Register = (on, options) => {
     } catch {
       // Nothing else draws in the band
     }
+    if (alert === null) return theirs ?? <Box />
 
     return (
       <Box flexDirection="column">
@@ -594,11 +592,38 @@ export const register: Register = (on, options) => {
             <Button key="hide" label="Ocultar" hotkey="3" plain onPress={() => hide($, alert)} />
           </Box>
         )}
+      </Box>
+    )
+  })
+
+  // The fixed line: a row of its own right under the prompt, with the engine's hint line kept beneath it
+  on('ui.render', { component: 'PromptHint' }, async ($, e, next) => {
+    const { Box, Text } = $.ui.resolve(e)
+    const reading = await read($, READING)
+    const model = await read($, MODEL)
+    const history = await read($, HISTORY)
+    const now = await nowOf($)
+
+    let theirs = null
+    try {
+      theirs = await next(e)
+    } catch {
+      // The engine draws no hint here
+    }
+    if (reading === null && model === null) return theirs ?? <Box />
+
+    const columns = Math.max(20, (e.viewport?.columns ?? 100) - 2)
+    const view = reading === null ? null : buildView(reading, now, cfg.t)
+    const pieces = fitPieces(linePieces(view, model, history, now), columns)
+
+    return (
+      <Box flexDirection="column">
         <Box flexDirection="row">
           {pieces.map(piece => (
             <Text {...textProps(piece)}>{piece.text}</Text>
           ))}
         </Box>
+        {theirs}
       </Box>
     )
   })

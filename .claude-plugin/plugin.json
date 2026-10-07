@@ -1,6 +1,6 @@
 {
   "name": "cuota",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Contexto y ventanas de 5 h y 7 d del plan siempre a la vista, con avisos y acciones cuando importan.",
   "author": { "name": "juanonoir" },
   "types": "./types/index.d.ts",
