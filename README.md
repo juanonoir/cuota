@@ -35,6 +35,7 @@ Si la banda es angosta, se descartan primero el sparkline, las barras y el effor
 | Qué | Cuándo | Botones |
 | --- | --- | --- |
 | Contexto | ▲ desde 70 %, ■ desde 90 % | `1` Compactar · `2` Desglose · `3` Ocultar |
+| Compactación | ▲ si compactar se paga en pocos turnos, o si el caché está frío | `1` Compactar · `2` Ver /cuota · `3` Ocultar |
 | Ventana de 5 h | ▲ si va por encima del ritmo parejo; ■ si además pasó el 50 %, o desde 80 % | `1` Pasar a Sonnet (sólo con Opus) · `2` Ver /cuota · `3` Ocultar |
 | Ventana de 7 d | Igual, con piso en 90 % | `2` Ver /cuota · `3` Ocultar |
 
@@ -57,9 +58,26 @@ Los dígitos funcionan escribiéndolos solos en el prompt vacío.
 
 Las ventanas son de la cuenta, no de la sesión: el ritmo incluye tus otras sesiones y jobs en paralelo.
 
+### Cuándo conviene compactar
+
+Cada request vuelve a mandar todo el contexto. Compactarlo tiene un costo fijo y después ahorra en cada request. El mod hace la cuenta con los precios de lista de cada modelo; en Opus 5.5, la lectura de caché cuesta 0,05× el input, el output 5× y la escritura de caché 2× con TTL de 1 h.
+
+- **Costo:** leer el contexto C una vez, generar el resumen S como output y guardarlo en el caché.
+- **Ahorro por request:** los mensajes que el resumen reemplaza, M − S, leídos del caché.
+- **M** es el contexto menos la parte fija (system prompt, herramientas, MCP), que el mod toma como el contexto más chico visto en la sesión, con tope de 60k.
+
+La banda avisa en dos casos:
+
+- **«Compactar se paga en ~N requests»:** cuando se paga en `compactPaybackTurns` turnos o menos. Usa la cantidad real de requests por turno, porque cada tool call reenvía el contexto.
+- **«Caché frío»:** pasó más que el TTL desde la última respuesta, así que el próximo request reescribe todo el contexto al 2×. Compactar en ese momento sale casi gratis.
+
+Cada compactación real, incluidas las automáticas, mide el tamaño del resumen y calibra la cuenta. Lo medido se guarda en el store y vale para las sesiones siguientes. El panel `/cuota` muestra los números en la sección COMPACTACIÓN.
+
 ### «Pasar a Sonnet»
 
-El botón intenta `/model sonnet` desde el mod y comprueba si el modelo cambió. Si el motor no lo aceptó, deja `/model sonnet` escrito en el prompt para que lo confirmes con Enter.
+El caché del prompt es de cada modelo: al cambiar, el modelo nuevo vuelve a cachear todo el contexto. Con contexto grande el botón pasa a ser **«Compactar y pasar a Sonnet»**, que compacta primero para que Sonnet cachee sólo el resumen. El panel muestra cuánto cuesta cada camino.
+
+El cambio intenta `/model sonnet` desde el mod y comprueba si el modelo cambió. Si el motor no lo aceptó, deja `/model sonnet` escrito en el prompt para que lo confirmes con Enter.
 
 ## Configuración
 
@@ -69,6 +87,7 @@ El botón intenta `/model sonnet` desde el mod y comprueba si el modelo cambió.
 | --- | --- |
 | `ctxWarn` · `ctxCrit` | 70 · 90 |
 | `fiveHourFloor` · `sevenDayFloor` | 80 · 90 |
+| `compactPaybackTurns` | 2 |
 | `downshiftModel` | `sonnet` |
 
 ## Desarrollo

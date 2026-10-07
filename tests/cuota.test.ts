@@ -1,6 +1,6 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
-import type { Engine } from 'claude-code/testing'
-import type { On, SessionRateLimit, SessionUsage } from 'claude-code'
+import type { Engine, MockClock } from 'claude-code/testing'
+import type { On, SessionCompactResult, SessionRateLimit, SessionUsage } from 'claude-code'
 
 const MIN = 60_000
 // Miércoles 7 de octubre de 2026, 14:05, hora local de quien corre el test
@@ -23,6 +23,13 @@ const usage = (percent: number, rateLimits: SessionRateLimit[]): SessionUsage =>
   rateLimits,
   cost: { usd: 4.8 },
 })
+/** A session on a 1M-context model with `tokens` of context. */
+const big = (tokens: number, rateLimits: SessionRateLimit[]): SessionUsage => ({
+  startedAt: NOW - 72 * MIN,
+  context: { tokens, window: 1_000_000, percent: Math.round(tokens / 10_000) },
+  rateLimits,
+  cost: { usd: 12.4 },
+})
 
 const SITE = { scroll: { offset: 0, bodyRows: 6 }, view: {} }
 const BAND = {
@@ -38,7 +45,14 @@ const PANE = {
 } as const
 
 /** What the stand-in engine saw the mod do. */
-type Seen = { toasts: string[]; statuses: (string | undefined)[]; opened: string[]; fills: string[]; compacted: number }
+type Seen = {
+  toasts: string[]
+  statuses: (string | undefined)[]
+  opened: string[]
+  fills: string[]
+  compacted: number
+  clock: MockClock
+}
 
 /**
  * Starts the session the way the engine does, with the figures `$.session.usage()` answers.
@@ -46,9 +60,14 @@ type Seen = { toasts: string[]; statuses: (string | undefined)[]; opened: string
  * Nothing answers beneath the plugins in a test, so this stands in for the engine on every call the mod
  * makes, once each (a test registers an event once): a `$` call answers `{ value }`, an event its result.
  */
-async function start($: Engine, on: On, figures: SessionUsage): Promise<Seen> {
-  const seen: Seen = { toasts: [], statuses: [], opened: [], fills: [], compacted: 0 }
-  mock.clock(on, { now: NOW })
+async function start(
+  $: Engine,
+  on: On,
+  figures: SessionUsage,
+  compaction: SessionCompactResult = { skip: 'probado' },
+): Promise<Seen> {
+  const clock = mock.clock(on, { now: NOW })
+  const seen: Seen = { toasts: [], statuses: [], opened: [], fills: [], compacted: 0, clock }
   mock.store(on)
   on('session.usage', () => ({ value: figures }))
   on('session.model', () => ({ value: 'claude-opus-5-5' }))
@@ -71,7 +90,7 @@ async function start($: Engine, on: On, figures: SessionUsage): Promise<Seen> {
   on('session.measure', ($, e) => ({ changed: e.changed }))
   on('session.compact', () => {
     seen.compacted += 1
-    return { skip: 'probado' }
+    return compaction
   })
   on('prompt.fill', ($, e) => {
     seen.fills.push(e.text)
@@ -148,5 +167,71 @@ describe('panel', () => {
       expect(await ui.find({ key: 'close' })).toBeDefined()
       await ui.unmount()
     }
+  })
+})
+
+describe('compactación', () => {
+  test('400k de contexto: la banda aconseja compactar y el botón compacta', async ($, on) => {
+    const seen = await start($, on, big(400_000, [five(30, 200)]))
+    const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+    expect(await ui.find({ text: /se paga en ~5 requests/ })).toBeDefined()
+    await ui.press({ key: 'compact' })
+    expect(seen.compacted).toBe(1)
+    await ui.unmount()
+  })
+
+  test('Opus, 5 h crítica y 400k: compacta y después pasa a Sonnet', async ($, on) => {
+    on('command.run', { command: 'model' }, () => ({}))
+    const seen = await start($, on, big(400_000, [five(86, 65)]))
+    const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+    expect(await ui.find({ text: /Compactar y pasar a Sonnet/ })).toBeDefined()
+    await ui.press({ key: 'downshift' })
+    expect(seen.compacted).toBe(1)
+    expect(seen.fills).toEqual(['/model sonnet'])
+    await ui.unmount()
+  })
+
+  test('con 104k el cambio de modelo va directo, sin compactar', async ($, on) => {
+    on('command.run', { command: 'model' }, () => ({}))
+    const seen = await start($, on, usage(52, [five(86, 65)]))
+    const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+    expect(await ui.find({ text: /^Pasar a Sonnet$/ })).toBeDefined()
+    await ui.press({ key: 'downshift' })
+    expect(seen.compacted).toBe(0)
+    await ui.unmount()
+  })
+
+  test('una hora sin respuestas: avisa que el caché está frío', async ($, on) => {
+    const seen = await start($, on, big(150_000, [five(30, 200)]))
+    const before = await $.ui.mount({ ...BAND, surface: 'terminal' })
+    expect(await before.find({ text: /Caché frío/ })).toBeUndefined()
+    await before.unmount()
+
+    await seen.clock.advance(61 * MIN)
+    const after = await $.ui.mount({ ...BAND, surface: 'terminal' })
+    expect(await after.find({ text: /Caché frío hace 1h01/ })).toBeDefined()
+    await after.unmount()
+  })
+
+  test('una compactación real calibra el tamaño del resumen', async ($, on) => {
+    const summary = [{ role: 'user' as const, text: 'Resumen de la conversación hasta acá.', toolUses: [] }]
+    await start($, on, big(400_000, [five(30, 200)]), {
+      messages: summary,
+      tokensBefore: 400_000,
+      tokensAfter: 67_000,
+      usage: { input_tokens: 0, output_tokens: 7_000, cache_read_input_tokens: 400_000, cache_creation_input_tokens: 0 },
+    })
+    await $.session.compact({
+      trigger: 'manual',
+      messages: [
+        { role: 'user', text: 'Ejecutar SCAN de ApiSupport', toolUses: [] },
+        { role: 'assistant', text: 'Tabla de SCAN arriba.', toolUses: [] },
+      ],
+    })
+    await $.command.run({ command: 'cuota', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 150 } })
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    expect(await ui.find({ text: /COMPACTACIÓN/ })).toBeDefined()
+    expect(await ui.find({ text: /resumen ~7k \(medido\)/ })).toBeDefined()
+    await ui.unmount()
   })
 })

@@ -5,28 +5,39 @@
 // `$` only travels into functions declared at the top of this file: the engine follows it there.
 
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, PluginOptions, Register, SessionMeasureInput, SessionUsage } from 'claude-code'
+import type { EngineInterface, PluginOptions, Register, SessionCompactResult, SessionMeasureInput, SessionUsage } from 'claude-code'
 
-import type { CuotaHistory, CuotaModel, CuotaReading } from '../types'
+import type { CuotaCompact, CuotaHistory, CuotaModel, CuotaReading } from '../types'
 import {
+  BASE_CAP,
   DEFAULT_COLOR,
+  DEFAULT_STEPS_PER_TURN,
+  DEFAULT_SUMMARY_TOKENS,
   DEFAULTS,
   asDay,
   bar,
   buildView,
+  compactAdvice,
+  compactAlert,
+  compactPayback,
   dayKey,
+  downshiftPlan,
   fitPieces,
   fiveSeries,
   formatCountdown,
   formatPace,
   formatResetAt,
   formatTokens,
+  formatUsd,
   glyphOf,
   heatColor,
   mergeSample,
   modelFamily,
+  nextStepsPerTurn,
+  nextSummaryTokens,
   packCells,
   pickAlert,
+  pricingOf,
   slotOf,
   spark,
   sparkChar,
@@ -35,12 +46,12 @@ import {
   weekGrid,
   weekKeys,
 } from './math'
-import type { Alert, DayRecord, Piece, Thresholds, Tone, View, WindowView } from './math'
+import type { Alert, CompactAdvice, DayRecord, Piece, Thresholds, Tone, View, WindowView } from './math'
 
 type $ = EngineInterface
 
-/** What the manifest's userConfig sets: the thresholds and the model the downshift button picks. */
-type Config = { t: Thresholds; target: string; targetLabel: string }
+/** What the manifest's userConfig sets: the thresholds, the payback horizon and the model the downshift button picks. */
+type Config = { t: Thresholds; paybackTurns: number; target: string; targetLabel: string }
 
 const PANE = 'cuota'
 const MIN = 60_000
@@ -53,9 +64,12 @@ const TOASTED = atom({ plugin: 'cuota', key: 'toasted' } as const, [])
 const BREAKDOWN = atom({ plugin: 'cuota', key: 'breakdown' } as const, null)
 const HISTORY = atom({ plugin: 'cuota', key: 'history' } as const, null)
 const PANE_OPEN = atom({ plugin: 'cuota', key: 'paneOpen' } as const, false)
+const COMPACT = atom({ plugin: 'cuota', key: 'compact' } as const, null)
 
 // The last status text sent, so the clock does not resend the same line every minute
 let lastStatus: string | undefined
+// Model requests the main thread has made in the turn under way
+let stepsThisTurn = 0
 
 function numberOption(value: unknown, fallback: number): number {
   const n = typeof value === 'number' ? value : typeof value === 'string' && value.trim() !== '' ? Number(value) : Number.NaN
@@ -72,6 +86,7 @@ function configOf(options: PluginOptions): Config {
       fiveHourFloor: numberOption(options.fiveHourFloor, DEFAULTS.fiveHourFloor),
       sevenDayFloor: numberOption(options.sevenDayFloor, DEFAULTS.sevenDayFloor),
     },
+    paybackTurns: numberOption(options.compactPaybackTurns, 2),
     target,
     targetLabel: target.charAt(0).toUpperCase() + target.slice(1),
   }
@@ -139,7 +154,19 @@ async function pruneStore($: $, now: number) {
 async function refreshBreakdown($: $) {
   try {
     const u = await $.session.usage({ breakdown: 'summary' })
-    const categories = (u.context.breakdown?.categories ?? [])
+    const breakdown = u.context.breakdown
+    if (breakdown !== undefined) {
+      await update($, COMPACT, prev =>
+        prev === null
+          ? null
+          : {
+              ...prev,
+              isAutoCompact: breakdown.isAutoCompactEnabled,
+              ...(breakdown.autoCompactThreshold === undefined ? {} : { autoCompactAt: breakdown.autoCompactThreshold }),
+            },
+      )
+    }
+    const categories = (breakdown?.categories ?? [])
       .filter(c => !c.isDeferred && c.tokens > 0)
       .sort((a, b) => b.tokens - a.tokens)
       .slice(0, 6)
@@ -154,10 +181,12 @@ async function refreshBreakdown($: $) {
 async function refresh($: $, cfg: Config) {
   const now = await $.clock.now()
   await update($, TICK, () => now)
+  await loadCompact($, now)
   try {
     const u = await $.session.usage()
     const reading = fromUsage(u, u.startedAt, now)
     await update($, READING, () => reading)
+    await noteContext($, reading.tokens)
     await recordSample($, reading, now)
   } catch {
     // No figures yet: the band waits for the first measurement
@@ -178,6 +207,7 @@ async function onMeasure($: $, cfg: Config, e: SessionMeasureInput) {
   const reading = fromUsage(e, prev?.startedAt ?? now, now)
   await update($, TICK, () => now)
   await update($, READING, () => reading)
+  await noteContext($, reading.tokens)
   await recordSample($, reading, now)
   await evaluate($, cfg)
   if (await read($, PANE_OPEN)) await refreshBreakdown($)
@@ -190,6 +220,7 @@ async function onTick($: $, cfg: Config) {
 }
 
 async function onStep($: $, model: string, effort: string | number | undefined) {
+  stepsThisTurn += 1
   try {
     const main = await $.session.model()
     const isFallback = modelFamily(main).label !== modelFamily(model).label
@@ -209,6 +240,101 @@ async function registerCommand($: $) {
   } catch {
     // A taken name leaves the band working without the command
   }
+}
+
+// ── Compaction advice ─────────────────────────────────────────────────
+
+const HOUR = 60 * MIN
+
+/** How long the prompt cache lives: an hour on a subscription (the one with plan windows), five minutes otherwise. */
+function cacheTtlMs(reading: CuotaReading): number {
+  return reading.limits.length > 0 ? HOUR : 5 * MIN
+}
+
+function freshCompact(now: number, summary: unknown): CuotaCompact {
+  const measured = typeof summary === 'number' && summary > 0
+  return {
+    lastResponseAt: now,
+    stepsPerTurn: 0,
+    summaryTokens: measured ? summary : DEFAULT_SUMMARY_TOKENS,
+    isSummaryMeasured: measured,
+  }
+}
+
+/** Starts the advice for the session; the summary size measured in earlier sessions is kept in the store. */
+async function loadCompact($: $, now: number) {
+  const summary = await $.store.get('summary')
+  await update($, COMPACT, prev => prev ?? freshCompact(now, summary))
+}
+
+/** The smallest context seen is what compacting cannot remove. */
+async function noteContext($: $, tokens: number | undefined) {
+  if (tokens === undefined) return
+  await update($, COMPACT, prev =>
+    prev === null ? null : { ...prev, baseTokens: Math.min(prev.baseTokens ?? tokens, tokens) },
+  )
+}
+
+async function sinceLastResponse($: $, seconds: number) {
+  const at = (await $.clock.now()) - seconds * 1000
+  await update($, COMPACT, prev => (prev === null ? null : { ...prev, lastResponseAt: at }))
+}
+
+async function onTurnComplete($: $) {
+  const steps = stepsThisTurn
+  stepsThisTurn = 0
+  const now = await $.clock.now()
+  await update($, COMPACT, prev =>
+    prev === null ? null : { ...prev, lastResponseAt: now, stepsPerTurn: steps > 0 ? nextStepsPerTurn(prev.stepsPerTurn, steps) : prev.stepsPerTurn },
+  )
+}
+
+/** A real compaction tells how big a summary comes out and what stays behind; both calibrate the advice. */
+async function onCompacted($: $, result: SessionCompactResult) {
+  if (result.skip !== undefined) return
+  const now = await $.clock.now()
+  const prev = await read($, COMPACT)
+  const compact = prev ?? freshCompact(now, undefined)
+  const sample = result.usage?.output_tokens
+  const summary =
+    sample !== undefined && sample > 0 ? Math.round(nextSummaryTokens(compact.summaryTokens, sample, compact.isSummaryMeasured)) : compact.summaryTokens
+  const base = result.tokensAfter === undefined ? compact.baseTokens : Math.max(0, result.tokensAfter - summary)
+  await update($, COMPACT, () => ({
+    ...compact,
+    lastResponseAt: now,
+    summaryTokens: summary,
+    isSummaryMeasured: compact.isSummaryMeasured || (sample !== undefined && sample > 0),
+    ...(base === undefined ? {} : { baseTokens: base }),
+  }))
+  if (sample !== undefined && sample > 0) await $.store.set('summary', summary)
+  await update($, DISMISSED, list => (list ?? []).filter(id => !id.startsWith('compact:')))
+}
+
+function adviceOf(reading: CuotaReading | null, compact: CuotaCompact | null, model: CuotaModel | null, now: number, cfg: Config): CompactAdvice | null {
+  if (reading === null || compact === null || model === null) return null
+  return compactAdvice({
+    ...(reading.tokens === undefined ? {} : { contextTokens: reading.tokens }),
+    ...(compact.baseTokens === undefined ? {} : { baseTokens: compact.baseTokens }),
+    summaryTokens: compact.summaryTokens,
+    stepsPerTurn: compact.stepsPerTurn > 0 ? compact.stepsPerTurn : DEFAULT_STEPS_PER_TURN,
+    model: model.model,
+    idleMs: Math.max(0, now - compact.lastResponseAt),
+    ttlMs: cacheTtlMs(reading),
+    paybackTurns: cfg.paybackTurns,
+  })
+}
+
+/** Whether switching model should compact first, and what each way costs. */
+function downshiftOf(reading: CuotaReading | null, compact: CuotaCompact | null, model: CuotaModel | null, cfg: Config) {
+  if (reading === null || reading.tokens === undefined || model === null) return null
+  return downshiftPlan(
+    reading.tokens,
+    Math.min(compact?.baseTokens ?? BASE_CAP, BASE_CAP),
+    compact?.summaryTokens ?? DEFAULT_SUMMARY_TOKENS,
+    pricingOf(model.model),
+    pricingOf(cfg.target),
+    cacheTtlMs(reading) >= HOUR ? 2 : 1.25,
+  )
 }
 
 // ── Alerts: the ⚠ line, the toasts, the dismissals ────────────────────
@@ -299,6 +425,12 @@ async function downshift($: $, cfg: Config) {
   )
 }
 
+/** Switching model throws the prompt cache away: compacting first leaves the new model only a summary to re-cache. */
+async function compactThenDownshift($: $, cfg: Config) {
+  await compactNow($)
+  await downshift($, cfg)
+}
+
 async function hide($: $, alert: Alert) {
   await update($, DISMISSED, list => [...(list ?? []), alert.id])
 }
@@ -366,8 +498,28 @@ export const register: Register = (on, options) => {
   // /clear, /resume and /branch empty $.state and do not fire session.start again
   on('classic.SessionStart', { source: ['clear', 'resume', 'fork'] }, async ($, e, next) => {
     await refresh($, cfg)
+    // A resumed session says how long ago its last response came, which is when its cache started cooling
+    if (e.seconds_since_last_response !== undefined) await sinceLastResponse($, e.seconds_since_last_response)
     return next(e)
   })
+
+  on('turn.complete', async ($, e, next) => {
+    if (e.agentId === undefined) await onTurnComplete($)
+    return next(e)
+  })
+
+  // Every compaction, the engine's own included, measures the summary the advice estimates
+  on('session.compact', async ($, e, next) => {
+    const result = await next(e)
+    if (e.agentId === undefined) {
+      try {
+        await onCompacted($, result)
+      } catch {
+        // The compaction stands either way
+      }
+    }
+    return result
+  }).catch(($, e, next) => next(e))
 
   on('session.measure', async ($, e, next) => {
     await onMeasure($, cfg, e)
@@ -399,13 +551,17 @@ export const register: Register = (on, options) => {
     const model = await read($, MODEL)
     const history = await read($, HISTORY)
     const dismissed = await read($, DISMISSED)
+    const compact = await read($, COMPACT)
     const now = await nowOf($)
     const columns = Math.max(20, e.props.bodyColumns)
 
     const view = reading === null ? null : buildView(reading, now, cfg.t)
     const pieces = fitPieces(linePieces(view, model, history, now), columns)
-    const alert = view === null ? null : pickAlert(view, dismissed)
+    const advice = adviceOf(reading, compact, model, now, cfg)
+    const extras = advice === null || compact === null ? [] : [compactAlert(advice, compact.lastResponseAt)]
+    const alert = view === null ? null : pickAlert(view, dismissed, extras)
     const isOpus = model !== null && modelFamily(model.model).label === 'OPUS'
+    const isCompactFirst = downshiftOf(reading, compact, model, cfg)?.isCompactFirst === true
 
     let theirs = null
     try {
@@ -422,9 +578,17 @@ export const register: Register = (on, options) => {
             <Text {...textProps({ tone: toneOf(alert.level) })}>
               {glyphOf(alert.level)} {alert.text}
             </Text>
-            {alert.unit === 'ctx' && <Button key="compact" label="Compactar" hotkey="1" plain onPress={() => compactNow($)} />}
+            {(alert.unit === 'ctx' || alert.unit === 'compact') && (
+              <Button key="compact" label="Compactar" hotkey="1" plain onPress={() => compactNow($)} />
+            )}
             {alert.unit === 'five_hour' && isOpus && (
-              <Button key="downshift" label={`Pasar a ${cfg.targetLabel}`} hotkey="1" plain onPress={() => downshift($, cfg)} />
+              <Button
+                key="downshift"
+                label={isCompactFirst ? `Compactar y pasar a ${cfg.targetLabel}` : `Pasar a ${cfg.targetLabel}`}
+                hotkey="1"
+                plain
+                onPress={() => (isCompactFirst ? compactThenDownshift($, cfg) : downshift($, cfg))}
+              />
             )}
             <Button key="open" label={alert.unit === 'ctx' ? 'Desglose' : 'Ver /cuota'} hotkey="2" plain onPress={() => openPane($)} />
             <Button key="hide" label="Ocultar" hotkey="3" plain onPress={() => hide($, alert)} />
@@ -518,6 +682,42 @@ export const register: Register = (on, options) => {
     }
     const isOpus = model !== null && modelFamily(model.model).label === 'OPUS'
 
+    // Compaction: what it would cost, what it saves, and how the cache stands
+    const compact = await read($, COMPACT)
+    const plan = downshiftOf(reading, compact, model, cfg)
+    const isCompactFirst = plan?.isCompactFirst === true
+    const compactRows: string[] = []
+    const autoText =
+      compact?.isAutoCompact === false
+        ? 'autocompact apagado'
+        : compact?.autoCompactAt !== undefined
+          ? `autocompact a ${formatTokens(compact.autoCompactAt)}`
+          : ''
+    if (compact !== null && reading.tokens !== undefined) {
+      const base = Math.min(compact.baseTokens ?? BASE_CAP, BASE_CAP)
+      const summary = compact.summaryTokens
+      const messages = Math.max(0, reading.tokens - base)
+      const ttl = cacheTtlMs(reading)
+      const idle = Math.max(0, now - compact.lastResponseAt)
+      const steps = compact.stepsPerTurn > 0 ? compact.stepsPerTurn : DEFAULT_STEPS_PER_TURN
+      compactRows.push(
+        `contexto ${formatTokens(reading.tokens)} · base ~${formatTokens(base)} · resumen ~${formatTokens(summary)} (${compact.isSummaryMeasured ? 'medido' : 'estimado'})`,
+      )
+      const payback = compactPayback(reading.tokens, messages, summary, pricingOf(model?.model ?? ''), ttl >= HOUR ? 2 : 1.25)
+      if (Number.isFinite(payback.requests)) {
+        compactRows.push(`compactar cuesta ~${formatUsd(payback.costUsd)} · ahorra ~${formatUsd(payback.savingUsd)} por request`)
+        compactRows.push(`se paga en ~${Math.round(payback.requests)} requests · turnos de ~${steps.toFixed(1).replace('.', ',')} requests`)
+      } else {
+        compactRows.push('todavía hay poco para achicar')
+      }
+      compactRows.push(idle > ttl ? `caché frío hace ${formatCountdown(idle)}` : `caché caliente · vence en ${formatCountdown(ttl - idle)}`)
+      if (isOpus && plan !== null) {
+        compactRows.push(
+          `pasar a ${cfg.targetLabel} re-cachea ${formatTokens(reading.tokens)} (~${formatUsd(plan.directUsd)})${isCompactFirst ? ` · compactando antes ~${formatUsd(plan.compactFirstUsd)}` : ''}`,
+        )
+      }
+    }
+
     return (
       <Box flexDirection="column">
         {head('CONTEXTO', ctxRight)}
@@ -559,6 +759,13 @@ export const register: Register = (on, options) => {
         })}
         <Text> </Text>
 
+        {head('COMPACTACIÓN', autoText)}
+        {compactRows.length === 0 && <Text dimColor> Sin cifras todavía: llegan con la primera respuesta.</Text>}
+        {compactRows.map(row => (
+          <Text>{`  ${row}`}</Text>
+        ))}
+        <Text> </Text>
+
         {head('RITMO DE 5 H', 'hace 5 h → ahora')}
         {paceRow}
         <Text> </Text>
@@ -578,7 +785,15 @@ export const register: Register = (on, options) => {
         <Text> </Text>
         <Box flexDirection="row" columnGap={3} flexWrap="wrap">
           <Button key="compact" label="Compactar ahora" hotkey="1" plain onPress={() => compactNow($)} />
-          {isOpus && <Button key="downshift" label={`Pasar a ${cfg.targetLabel}`} hotkey="2" plain onPress={() => downshift($, cfg)} />}
+          {isOpus && (
+            <Button
+              key="downshift"
+              label={isCompactFirst ? `Compactar y pasar a ${cfg.targetLabel}` : `Pasar a ${cfg.targetLabel}`}
+              hotkey="2"
+              plain
+              onPress={() => (isCompactFirst ? compactThenDownshift($, cfg) : downshift($, cfg))}
+            />
+          )}
           <Button key="close" label="Cerrar" hotkey="3" plain onPress={() => closePane($)} />
         </Box>
       </Box>

@@ -28,9 +28,26 @@ export type CuotaHistory = {
   weekDays: string[]
 }
 
+/** What the compaction advice learns as the session runs. */
+export type CuotaCompact = {
+  /** When the main thread last got a response: the prompt cache's clock starts there. */
+  lastResponseAt: number
+  /** Model requests per main-thread turn, as a running average; 0 until a turn has finished. */
+  stepsPerTurn: number
+  /** How big a compaction summary comes out: a default until a real compaction measures it. */
+  summaryTokens: number
+  isSummaryMeasured: boolean
+  /** The smallest context seen this session: what compacting cannot remove (system prompt, tools, MCP, memory). */
+  baseTokens?: number
+  /** Where the engine compacts on its own, from the /context breakdown. */
+  autoCompactAt?: number
+  isAutoCompact?: boolean
+}
+
 declare module 'claude-code' {
   interface PluginState {
     cuota: {
+      compact: CuotaCompact | null
       reading: CuotaReading | null
       model: CuotaModel | null
       tick: number

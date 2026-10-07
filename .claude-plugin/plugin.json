@@ -1,6 +1,6 @@
 {
   "name": "cuota",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Contexto y ventanas de 5 h y 7 d del plan siempre a la vista, con avisos y acciones cuando importan.",
   "author": { "name": "juanonoir" },
   "types": "./types/index.d.ts",
@@ -28,6 +28,12 @@
       "title": "Ventana de 7 d: crítico desde (%)",
       "description": "Piso fijo para la ventana semanal.",
       "default": 90
+    },
+    "compactPaybackTurns": {
+      "type": "number",
+      "title": "Compactar: avisar si se paga en (turnos)",
+      "description": "La banda aconseja compactar cuando el ahorro cubre el costo de la compactación en esta cantidad de turnos o menos. Con el caché frío avisa siempre que haya bastante para achicar.",
+      "default": 2
     },
     "downshiftModel": {
       "type": "string",

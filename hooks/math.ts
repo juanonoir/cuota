@@ -228,11 +228,14 @@ function contextAlertText(view: View): string {
   return `Contexto ${Math.round(percent)} %${size} · el motor autocompacta antes del 100 %`
 }
 
-const UNIT_ORDER = ['five_hour', 'ctx', 'seven_day']
+const UNIT_ORDER = ['five_hour', 'ctx', 'compact', 'seven_day']
 
-/** The one alert the band shows: the worst level first, then 5 h, context, 7 d; dismissed ids skipped. */
-export function pickAlert(view: View, dismissed: readonly string[]): Alert | null {
-  const candidates: Alert[] = []
+/**
+ * The one alert the band shows: the worst level first, then 5 h, context, compaction, 7 d; dismissed ids skipped.
+ * `extras` are alerts worked out outside the view (the compaction advice).
+ */
+export function pickAlert(view: View, dismissed: readonly string[], extras: readonly Alert[] = []): Alert | null {
+  const candidates: Alert[] = [...extras]
   if (view.context.level !== 'ok') {
     candidates.push({ id: `ctx:${view.context.level}`, unit: 'ctx', level: view.context.level, text: contextAlertText(view) })
   }
@@ -262,6 +265,135 @@ export function statusText(view: View): string | undefined {
     parts.push(`${w.label} al ${Math.round(w.used)} %${tail}`)
   }
   return parts.length === 0 ? undefined : parts.join('  ·  ')
+}
+
+// ── Compaction: when it pays for itself ───────────────────────────────
+
+/** US$ per million tokens: base input and cache read. Output costs 5× input and a cache write 1.25× (5 min) or 2× (1 h). */
+export type Pricing = { input: number; read: number }
+
+export const OUTPUT_RATIO = 5
+/** Below this much context left over after compacting, the advice stays quiet. */
+export const MIN_SAVING_TOKENS = 30_000
+/** The fixed part of the context (system prompt, tools, MCP, memory) never counts above this. */
+export const BASE_CAP = 60_000
+export const DEFAULT_SUMMARY_TOKENS = 10_000
+export const DEFAULT_STEPS_PER_TURN = 3
+
+const HOUR_MS = 60 * MIN
+
+/** Anthropic's list prices (claude-api reference, 2026-09-25) by model family; unknown models price as Opus 5. */
+export function pricingOf(model: string): Pricing {
+  if (/(fable|mythos)[^0-9]*5[-.]1/i.test(model)) return { input: 10, read: 0.25 }
+  if (/fable|mythos/i.test(model)) return { input: 10, read: 1 }
+  if (/opus[^0-9]*5[-.]5/i.test(model)) return { input: 4, read: 0.2 }
+  if (/opus/i.test(model)) return { input: 5, read: 0.5 }
+  if (/sonnet[^0-9]*4[-.]6/i.test(model)) return { input: 3, read: 0.3 }
+  if (/sonnet/i.test(model)) return { input: 2, read: 0.2 }
+  if (/haiku/i.test(model)) return { input: 1, read: 0.1 }
+  return { input: 5, read: 0.5 }
+}
+
+export type Payback = { costUsd: number; savingUsd: number; requests: number }
+
+/**
+ * Compacting reads the context once from the cache, writes a summary as output and caches it;
+ * afterwards every request re-sends the summary instead of the messages it replaced.
+ */
+export function compactPayback(contextTokens: number, messagesTokens: number, summaryTokens: number, pricing: Pricing, writeRatio: number): Payback {
+  const perToken = pricing.input / 1e6
+  const readPerToken = pricing.read / 1e6
+  const costUsd = readPerToken * contextTokens + (OUTPUT_RATIO + writeRatio) * perToken * summaryTokens
+  const savingUsd = readPerToken * Math.max(0, messagesTokens - summaryTokens)
+  return { costUsd, savingUsd, requests: savingUsd > 0 ? costUsd / savingUsd : Number.POSITIVE_INFINITY }
+}
+
+export type CompactAdvice = {
+  /** `payback`: it pays back within a few turns; `cold`: the cache expired, so the next request re-caches everything anyway. */
+  reason: 'payback' | 'cold'
+  requests: number
+  savingUsd: number
+  rewriteUsd: number
+  contextTokens: number
+  idleMs: number
+}
+
+export type CompactAdviceInput = {
+  contextTokens?: number
+  baseTokens?: number
+  summaryTokens: number
+  stepsPerTurn: number
+  model: string
+  idleMs: number
+  ttlMs: number
+  paybackTurns: number
+}
+
+export function compactAdvice(input: CompactAdviceInput): CompactAdvice | null {
+  const context = input.contextTokens
+  if (context === undefined) return null
+  const base = Math.min(input.baseTokens ?? BASE_CAP, BASE_CAP)
+  const messages = Math.max(0, context - base)
+  if (messages - input.summaryTokens < MIN_SAVING_TOKENS) return null
+
+  const pricing = pricingOf(input.model)
+  const writeRatio = input.ttlMs >= HOUR_MS ? 2 : 1.25
+  const payback = compactPayback(context, messages, input.summaryTokens, pricing, writeRatio)
+  const advice = {
+    requests: payback.requests,
+    savingUsd: payback.savingUsd,
+    rewriteUsd: (writeRatio * pricing.input * context) / 1e6,
+    contextTokens: context,
+    idleMs: input.idleMs,
+  }
+  if (input.idleMs > input.ttlMs) return { reason: 'cold', ...advice }
+  if (payback.requests <= input.paybackTurns * Math.max(1, input.stepsPerTurn)) return { reason: 'payback', ...advice }
+  return null
+}
+
+export function compactAlertText(advice: CompactAdvice): string {
+  if (advice.reason === 'cold') {
+    return `Caché frío hace ${formatCountdown(advice.idleMs)} · seguir reescribe ${formatTokens(advice.contextTokens)} (~${formatUsd(advice.rewriteUsd)}); compactar antes ahorra ~${formatUsd(advice.savingUsd)} por request`
+  }
+  return `Compactar se paga en ~${Math.round(advice.requests)} requests · ahorra ~${formatUsd(advice.savingUsd)} por request con ${formatTokens(advice.contextTokens)} de contexto`
+}
+
+/** The band's alert for the advice; its id changes with each idle stretch or each 50k of context, so a dismissal lasts until then. */
+export function compactAlert(advice: CompactAdvice, lastResponseAt: number): Alert {
+  const key = advice.reason === 'cold' ? String(lastResponseAt) : String(Math.floor(advice.contextTokens / 50_000))
+  return { id: `compact:${advice.reason}:${key}`, unit: 'compact', level: 'warn', text: compactAlertText(advice) }
+}
+
+/**
+ * Switching model forfeits the prompt cache (it is per model), so the new model re-caches the whole context.
+ * Compacting first means it re-caches only the base and the summary.
+ */
+export function downshiftPlan(
+  contextTokens: number,
+  baseTokens: number,
+  summaryTokens: number,
+  from: Pricing,
+  to: Pricing,
+  writeRatio: number,
+): { directUsd: number; compactFirstUsd: number; isCompactFirst: boolean } {
+  const directUsd = (writeRatio * to.input * contextTokens) / 1e6
+  const compactFirstUsd =
+    (from.read * contextTokens + OUTPUT_RATIO * from.input * summaryTokens + writeRatio * to.input * (baseTokens + summaryTokens)) / 1e6
+  return { directUsd, compactFirstUsd, isCompactFirst: compactFirstUsd < directUsd }
+}
+
+/** Requests per turn as a running average, the latest turn weighing 30 %. */
+export function nextStepsPerTurn(previous: number, steps: number): number {
+  return previous <= 0 ? steps : 0.7 * previous + 0.3 * steps
+}
+
+/** A summary size learned from real compactions, the latest weighing 40 %. */
+export function nextSummaryTokens(previous: number, sample: number, isCalibrated: boolean): number {
+  return isCalibrated ? 0.6 * previous + 0.4 * sample : sample
+}
+
+export function formatUsd(usd: number): string {
+  return usd < 0.005 ? '<US$0,01' : `US$${usd.toFixed(2).replace('.', ',')}`
 }
 
 // ── History kept in $.store ───────────────────────────────────────────

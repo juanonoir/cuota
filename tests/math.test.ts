@@ -4,7 +4,14 @@ import {
   DEFAULTS,
   bar,
   buildView,
+  compactAdvice,
+  compactAlertText,
+  compactPayback,
   contextLevel,
+  downshiftPlan,
+  formatUsd,
+  nextStepsPerTurn,
+  pricingOf,
   fitPieces,
   fiveSeries,
   formatCountdown,
@@ -206,5 +213,83 @@ describe('vista y alertas', () => {
     const view = buildView(reading(31, [five(42, 134)]), NOW, DEFAULTS)
     expect(pickAlert(view, [])).toBeNull()
     expect(view.worst).toBe('ok')
+  })
+})
+
+describe('compactación', () => {
+  const OPUS = pricingOf('claude-opus-5-5[1m]')
+  const SONNET = pricingOf('sonnet')
+
+  test('precios por modelo: input y lectura de caché en US$/MTok', () => {
+    expect(OPUS).toEqual({ input: 4, read: 0.2 })
+    expect(pricingOf('Sonnet 5.5')).toEqual({ input: 2, read: 0.2 })
+    expect(SONNET).toEqual({ input: 2, read: 0.2 })
+    expect(pricingOf('claude-fable-5-1')).toEqual({ input: 10, read: 0.25 })
+    expect(pricingOf('claude-haiku-4-5')).toEqual({ input: 1, read: 0.1 })
+    expect(pricingOf('modelo-desconocido')).toEqual({ input: 5, read: 0.5 })
+  })
+
+  test('400k de contexto en Opus 5.5: compactar cuesta US$0,36 y ahorra US$0,07 por request', () => {
+    const p = compactPayback(400_000, 360_000, 10_000, OPUS, 2)
+    expect(Math.round(p.costUsd * 100)).toBe(36)
+    expect(Math.round(p.savingUsd * 100)).toBe(7)
+    expect(p.requests).toBeGreaterThan(5.1)
+    expect(p.requests).toBeLessThan(5.2)
+  })
+
+  const advise = (contextTokens: number, idleMin: number, stepsPerTurn = 3) =>
+    compactAdvice({
+      contextTokens,
+      baseTokens: 40_000,
+      summaryTokens: 10_000,
+      stepsPerTurn,
+      model: 'claude-opus-5-5',
+      idleMs: idleMin * 60_000,
+      ttlMs: 60 * 60_000,
+      paybackTurns: 2,
+    })
+
+  test('con caché caliente aconseja cuando se paga en pocos turnos', () => {
+    expect(advise(400_000, 1)?.reason).toBe('payback')
+    expect(advise(120_000, 1)).toBeNull()
+    // Con turnos de 12 requests, 120k ya se paga en menos de 2 turnos
+    expect(advise(120_000, 1, 12)?.reason).toBe('payback')
+  })
+
+  test('con caché frío aconseja si hay bastante para achicar', () => {
+    expect(advise(120_000, 61)?.reason).toBe('cold')
+    expect(advise(60_000, 61)).toBeNull()
+  })
+
+  test('el texto de la alerta trae los números', () => {
+    const hot = advise(400_000, 1)
+    expect(hot === null ? '' : compactAlertText(hot)).toContain('se paga en ~5 requests')
+    const cold = advise(120_000, 61)
+    expect(cold === null ? '' : compactAlertText(cold)).toContain('Caché frío hace 1h01')
+  })
+
+  test('pasar a Sonnet: con contexto grande conviene compactar antes', () => {
+    expect(downshiftPlan(400_000, 60_000, 10_000, OPUS, SONNET, 2).isCompactFirst).toBe(true)
+    expect(downshiftPlan(104_000, 60_000, 10_000, OPUS, SONNET, 2).isCompactFirst).toBe(false)
+    expect(Math.round(downshiftPlan(400_000, 60_000, 10_000, OPUS, SONNET, 2).directUsd * 100)).toBe(160)
+  })
+
+  test('formato de dólares y promedio de requests por turno', () => {
+    expect(formatUsd(0.07)).toBe('US$0,07')
+    expect(formatUsd(3.2)).toBe('US$3,20')
+    expect(formatUsd(0.004)).toBe('<US$0,01')
+    expect(nextStepsPerTurn(0, 8)).toBe(8)
+    expect(nextStepsPerTurn(5, 10)).toBe(6.5)
+  })
+
+  test('la alerta de compactar cede ante una ventana crítica', () => {
+    const view = buildView(
+      { at: NOW, startedAt: NOW, tokens: 400_000, window: 1_000_000, percent: 40, limits: [five(86, 65)] },
+      NOW,
+      DEFAULTS,
+    )
+    const compact = { id: 'compact:payback:8', unit: 'compact', level: 'warn' as const, text: 'Compactar' }
+    expect(pickAlert(view, [], [compact])?.unit).toBe('five_hour')
+    expect(pickAlert(view, [pickAlert(view, [])?.id ?? ''], [compact])?.unit).toBe('compact')
   })
 })
