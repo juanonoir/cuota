@@ -1,0 +1,4 @@
+# Lo escribe Claude Code en cada carga del mod: tipos de la build y el tsconfig que los extiende
+.claude-plugin/types/
+/tsconfig.json
+node_modules/

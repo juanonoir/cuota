@@ -1,0 +1,39 @@
+{
+  "name": "cuota",
+  "version": "0.1.0",
+  "description": "Contexto y ventanas de 5 h y 7 d del plan siempre a la vista, con avisos y acciones cuando importan.",
+  "author": { "name": "juanonoir" },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "ctxWarn": {
+      "type": "number",
+      "title": "Contexto: aviso desde (%)",
+      "description": "Desde este porcentaje del contexto aparece la alerta ámbar con el botón para compactar.",
+      "default": 70
+    },
+    "ctxCrit": {
+      "type": "number",
+      "title": "Contexto: crítico desde (%)",
+      "description": "Desde este porcentaje la alerta pasa a roja, sale un aviso y la línea ⚠ bajo el prompt.",
+      "default": 90
+    },
+    "fiveHourFloor": {
+      "type": "number",
+      "title": "Ventana de 5 h: crítico desde (%)",
+      "description": "Piso fijo para la ventana de 5 h, aunque el ritmo diga que llegás al reset.",
+      "default": 80
+    },
+    "sevenDayFloor": {
+      "type": "number",
+      "title": "Ventana de 7 d: crítico desde (%)",
+      "description": "Piso fijo para la ventana semanal.",
+      "default": 90
+    },
+    "downshiftModel": {
+      "type": "string",
+      "title": "Modelo para bajar",
+      "description": "El modelo que pone el botón «Pasar a …» cuando la ventana de 5 h se agota.",
+      "default": "sonnet"
+    }
+  }
+}

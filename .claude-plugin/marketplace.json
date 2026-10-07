@@ -1,0 +1,6 @@
+{
+  "name": "cuota",
+  "description": "El mod cuota para Claude Code: contexto y ventanas de 5 h y 7 d del plan siempre a la vista.",
+  "owner": { "name": "juanonoir" },
+  "plugins": [{ "name": "cuota", "source": "./" }]
+}
