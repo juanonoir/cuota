@@ -44,9 +44,17 @@ export type CuotaCompact = {
   isAutoCompact?: boolean
 }
 
+/** The turn under way: its model requests so far and what they cost. */
+export type CuotaTurn = { turnId: string; steps: number; costUsd: number; readTokens: number; sentTokens: number }
+
+/** A finished turn, matched to its "Worked for" line by duration. */
+export type CuotaTurnDone = { durationMs: number; steps: number; costUsd: number; readTokens: number; sentTokens: number }
+
 declare module 'claude-code' {
   interface PluginState {
     cuota: {
+      turn: CuotaTurn | null
+      turns: CuotaTurnDone[]
       compact: CuotaCompact | null
       reading: CuotaReading | null
       model: CuotaModel | null

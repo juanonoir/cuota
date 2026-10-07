@@ -101,8 +101,34 @@ async function start(
     seen.fills.push(e.text)
     return { isFilled: true }
   })
+  on('turn.start', ($, e) => ({ turnId: e.turnId }))
+  on('turn.complete', ($, e) => ({ text: '', ...(e.usage === undefined ? {} : { usage: e.usage }) }))
+  // Every model request of a test turn reads 100k from the cache
+  on('turn.step', async function* ($, e) {
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn' as const, usage: { ...STEP_USAGE, model: e.model } }
+  })
+  // The engine's own drawing, where a hook asks for it: its word, suffix or hint as one line
+  on('ui.render', ($, e) => {
+    const { Box, Text } = $.ui.resolve(e)
+    const props = e.props as unknown as Record<string, unknown>
+    const text = ['word', 'suffix', 'hint'].map(key => props[key]).filter(value => typeof value === 'string').join('')
+    return text === '' ? Box({}) : Text({ children: [text] })
+  })
   await $.session.start({ cwd: '.', surface: 'terminal', isInteractive: true })
   return seen
+}
+
+const STEP_USAGE = { input_tokens: 2_000, output_tokens: 1_000, cache_read_input_tokens: 100_000, cache_creation_input_tokens: 5_000 }
+
+/** Runs one main-thread turn of `steps` model requests that lasts `durationMs`. */
+async function runTurn($: Engine, turnId: string, steps: number, durationMs: number) {
+  await $.turn.start({ text: 'Ejecutar SCAN de ApiSupport', turnId })
+  for (let index = 0; index < steps; index++) {
+    const stream = $.turn.step({ turnId, index, model: 'claude-opus-5-5', messageCount: 3 + index })
+    for await (const chunk of stream) void chunk
+    await stream.result
+  }
+  await $.turn.complete({ answer: 'Listo.', durationMs, isAborted: false, turnId, reason: 'answer' })
 }
 
 describe('banda', () => {
@@ -243,5 +269,42 @@ describe('compactación', () => {
     expect(await ui.find({ text: /COMPACTACIÓN/ })).toBeDefined()
     expect(await ui.find({ text: /resumen ~7k \(medido\)/ })).toBeDefined()
     await ui.unmount()
+  })
+})
+
+describe('datos del turno', () => {
+  test('el cierre del turno suma requests, caché y costo', async ($, on) => {
+    await start($, on, big(150_000, [five(30, 200)]))
+    await runTurn($, 't1', 3, 125_000)
+    const ui = await $.ui.mount({
+      plugin: 'cuota',
+      surface: 'terminal',
+      component: 'TurnDuration',
+      requestId: 'm1',
+      props: { word: 'Worked for 2m 05s', durationMs: 125_000 },
+    })
+    // 3 requests de 107k enviados, 100k leídos del caché: 93 %; 3 × US$0,088
+    expect(await ui.find({ text: /Worked for 2m 05s/ })).toBeDefined()
+    expect(await ui.find({ text: /3 requests · 93 % desde caché · ~US\$0,26/ })).toBeDefined()
+    await ui.unmount()
+  })
+
+  test('mientras trabaja, el spinner muestra el contexto y lo que va del turno', async ($, on) => {
+    await start($, on, big(150_000, [five(30, 200)]))
+    await $.turn.start({ text: 'Armá el informe', turnId: 't2' })
+    const stream = $.turn.step({ turnId: 't2', index: 0, model: 'claude-opus-5-5', messageCount: 3 })
+    for await (const chunk of stream) void chunk
+    await stream.result
+    for (const surface of ['terminal', 'desktop'] as const) {
+      const ui = await $.ui.mount({
+        plugin: 'cuota',
+        surface,
+        component: 'Spinner',
+        requestId: 'main',
+        props: { word: 'Pensando…', message: null, suffix: ' (14s)', mode: 'thinking' },
+      })
+      expect(await ui.find({ text: /Pensando… \(14s\) · ctx 15% · turno ~US\$0,09/ })).toBeDefined()
+      await ui.unmount()
+    }
   })
 })

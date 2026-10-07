@@ -7,6 +7,11 @@ import {
   compactAdvice,
   compactAlertText,
   compactPayback,
+  addUsage,
+  cacheShare,
+  findTurn,
+  turnSummary,
+  usageCostUsd,
   contextLevel,
   downshiftPlan,
   formatUsd,
@@ -291,5 +296,39 @@ describe('compactación', () => {
     const compact = { id: 'compact:payback:8', unit: 'compact', level: 'warn' as const, text: 'Compactar' }
     expect(pickAlert(view, [], [compact])?.unit).toBe('five_hour')
     expect(pickAlert(view, [pickAlert(view, [])?.id ?? ''], [compact])?.unit).toBe('compact')
+  })
+})
+
+describe('turno', () => {
+  const OPUS = pricingOf('claude-opus-5-5')
+  const usage = { input_tokens: 2_000, output_tokens: 1_000, cache_read_input_tokens: 100_000, cache_creation_input_tokens: 5_000 }
+
+  test('costo de un request: input, escritura y lectura de caché y output', () => {
+    // 2k × $4 + 5k × $8 + 100k × $0,20 + 1k × $20, por millón
+    expect(Math.round(usageCostUsd(usage, OPUS, 2) * 1000)).toBe(88)
+    expect(Math.round(cacheShare(usage) * 100)).toBe(93)
+  })
+
+  test('los requests de un turno se suman', () => {
+    const empty = { steps: 0, costUsd: 0, readTokens: 0, sentTokens: 0 }
+    const two = addUsage(addUsage(empty, usage, OPUS, 2), usage, OPUS, 2)
+    expect(two.steps).toBe(2)
+    expect(two.readTokens).toBe(200_000)
+    expect(two.sentTokens).toBe(214_000)
+    expect(Math.round(two.costUsd * 1000)).toBe(176)
+  })
+
+  test('el resumen del turno', () => {
+    expect(turnSummary({ steps: 9, costUsd: 0.11, readTokens: 960, sentTokens: 1000 })).toBe('9 requests · 96 % desde caché · ~US$0,11')
+    expect(turnSummary({ steps: 1, costUsd: 0.004, readTokens: 0, sentTokens: 0 })).toBe('1 request · <US$0,01')
+  })
+
+  test('cada línea de cierre encuentra su turno por la duración', () => {
+    const turns = [
+      { durationMs: 41_000, steps: 3, costUsd: 0.02, readTokens: 1, sentTokens: 1 },
+      { durationMs: 125_300, steps: 9, costUsd: 0.11, readTokens: 1, sentTokens: 1 },
+    ]
+    expect(findTurn(turns, 125_000)?.steps).toBe(9)
+    expect(findTurn(turns, 300_000)).toBeUndefined()
   })
 })

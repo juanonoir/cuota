@@ -1,10 +1,12 @@
 // Pure arithmetic and formatting for cuota: no `$`, no clock, no store.
 // Every figure the band and the pane draw goes through here, so it is tested on its own.
 
-import type { CuotaLimit, CuotaReading } from '../types'
+import type { ModelUsage } from 'claude-code'
+
+import type { CuotaLimit, CuotaReading, CuotaTurnDone } from '../types'
 
 export type Level = 'ok' | 'warn' | 'crit'
-export type Tone = 'error' | 'warning' | 'success' | 'text'
+export type Tone = 'error' | 'warning' | 'success' | 'suggestion' | 'text'
 
 export type Thresholds = {
   ctxWarn: number
@@ -176,8 +178,11 @@ function peakOf(values: readonly (number | null)[]): number | null {
   return peak
 }
 
-/** A run of text the band draws; `drop` above 0 marks it optional, the highest dropped first. */
-export type Piece = { text: string; tone?: Tone; bold?: boolean; dim?: boolean; drop?: number }
+/**
+ * A run of text the line draws; `drop` above 0 marks it optional, the highest dropped first.
+ * `seg` names the segment it belongs to (the hover card groups by it) and `bg` a background (the pill style).
+ */
+export type Piece = { text: string; tone?: Tone; bold?: boolean; dim?: boolean; drop?: number; seg?: string; bg?: string }
 
 export function widthOf(pieces: readonly Piece[]): number {
   return pieces.reduce((n, p) => n + [...p.text].length, 0)
@@ -390,6 +395,59 @@ export function nextStepsPerTurn(previous: number, steps: number): number {
 /** A summary size learned from real compactions, the latest weighing 40 %. */
 export function nextSummaryTokens(previous: number, sample: number, isCalibrated: boolean): number {
   return isCalibrated ? 0.6 * previous + 0.4 * sample : sample
+}
+
+// ── What each turn costs ──────────────────────────────────────────────
+
+/** One request's cost at list price: input, cache write, cache read and output. */
+export function usageCostUsd(usage: ModelUsage, pricing: Pricing, writeRatio: number): number {
+  return (
+    (usage.input_tokens * pricing.input +
+      usage.cache_creation_input_tokens * pricing.input * writeRatio +
+      usage.cache_read_input_tokens * pricing.read +
+      usage.output_tokens * pricing.input * OUTPUT_RATIO) /
+    1e6
+  )
+}
+
+function sentOf(usage: ModelUsage): number {
+  return usage.input_tokens + usage.cache_creation_input_tokens + usage.cache_read_input_tokens
+}
+
+/** The share of what a request sent that came out of the prompt cache. */
+export function cacheShare(usage: ModelUsage): number {
+  const sent = sentOf(usage)
+  return sent > 0 ? usage.cache_read_input_tokens / sent : 0
+}
+
+export type TurnTotals = { steps: number; costUsd: number; readTokens: number; sentTokens: number }
+
+export function addUsage(totals: TurnTotals, usage: ModelUsage, pricing: Pricing, writeRatio: number): TurnTotals {
+  return {
+    steps: totals.steps + 1,
+    costUsd: totals.costUsd + usageCostUsd(usage, pricing, writeRatio),
+    readTokens: totals.readTokens + usage.cache_read_input_tokens,
+    sentTokens: totals.sentTokens + sentOf(usage),
+  }
+}
+
+/** What the line closing a turn adds: its requests, how much came from the cache and what it cost. */
+export function turnSummary(totals: TurnTotals): string {
+  const parts = [`${totals.steps} ${totals.steps === 1 ? 'request' : 'requests'}`]
+  if (totals.sentTokens > 0) parts.push(`${Math.round((totals.readTokens / totals.sentTokens) * 100)} % desde caché`)
+  // Under a cent the amount already reads "<US$0,01"; the tilde would only add noise
+  parts.push(totals.costUsd < 0.005 ? formatUsd(totals.costUsd) : `~${formatUsd(totals.costUsd)}`)
+  return parts.join(' · ')
+}
+
+/** The finished turn a "Worked for" line belongs to: the one whose duration is nearest, within 1.5 s. */
+export function findTurn(turns: readonly CuotaTurnDone[], durationMs: number): CuotaTurnDone | undefined {
+  let best: CuotaTurnDone | undefined
+  for (const turn of turns) {
+    const gap = Math.abs(turn.durationMs - durationMs)
+    if (gap <= 1500 && (best === undefined || gap < Math.abs(best.durationMs - durationMs))) best = turn
+  }
+  return best
 }
 
 export function formatUsd(usd: number): string {

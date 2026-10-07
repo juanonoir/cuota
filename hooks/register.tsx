@@ -5,10 +5,21 @@
 // `$` only travels into functions declared at the top of this file: the engine follows it there.
 
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, PluginOptions, Register, SessionCompactResult, SessionMeasureInput, SessionUsage } from 'claude-code'
+import type {
+  EngineInterface,
+  PluginOptions,
+  Register,
+  SessionCompactResult,
+  SessionMeasureInput,
+  SessionUsage,
+  TurnUsage,
+} from 'claude-code'
 
 import type { CuotaCompact, CuotaHistory, CuotaModel, CuotaReading } from '../types'
 import {
+  addUsage,
+  findTurn,
+  turnSummary,
   BASE_CAP,
   DEFAULT_COLOR,
   DEFAULT_STEPS_PER_TURN,
@@ -65,11 +76,11 @@ const BREAKDOWN = atom({ plugin: 'cuota', key: 'breakdown' } as const, null)
 const HISTORY = atom({ plugin: 'cuota', key: 'history' } as const, null)
 const PANE_OPEN = atom({ plugin: 'cuota', key: 'paneOpen' } as const, false)
 const COMPACT = atom({ plugin: 'cuota', key: 'compact' } as const, null)
+const TURN = atom({ plugin: 'cuota', key: 'turn' } as const, null)
+const TURNS = atom({ plugin: 'cuota', key: 'turns' } as const, [])
 
 // The last status text sent, so the clock does not resend the same line every minute
 let lastStatus: string | undefined
-// Model requests the main thread has made in the turn under way
-let stepsThisTurn = 0
 
 function numberOption(value: unknown, fallback: number): number {
   const n = typeof value === 'number' ? value : typeof value === 'string' && value.trim() !== '' ? Number(value) : Number.NaN
@@ -219,8 +230,22 @@ async function onTick($: $, cfg: Config) {
   await evaluate($, cfg)
 }
 
+async function onTurnStart($: $, turnId: string) {
+  await update($, TURN, () => ({ turnId, steps: 0, costUsd: 0, readTokens: 0, sentTokens: 0 }))
+}
+
+/** Adds one model request of the turn under way: its tokens, priced at the model that answered. */
+async function onStepDone($: $, turnId: string, usage: TurnUsage | null) {
+  if (usage === null) return
+  const reading = await read($, READING)
+  const writeRatio = reading !== null && reading.limits.length > 0 ? 2 : 1.25
+  await update($, TURN, prev => {
+    const base = prev !== null && prev.turnId === turnId ? prev : { turnId, steps: 0, costUsd: 0, readTokens: 0, sentTokens: 0 }
+    return { turnId, ...addUsage(base, usage, pricingOf(usage.model), writeRatio) }
+  })
+}
+
 async function onStep($: $, model: string, effort: string | number | undefined) {
-  stepsThisTurn += 1
   try {
     const main = await $.session.model()
     const isFallback = modelFamily(main).label !== modelFamily(model).label
@@ -280,9 +305,14 @@ async function sinceLastResponse($: $, seconds: number) {
   await update($, COMPACT, prev => (prev === null ? null : { ...prev, lastResponseAt: at }))
 }
 
-async function onTurnComplete($: $) {
-  const steps = stepsThisTurn
-  stepsThisTurn = 0
+/** Closes the turn: keeps its totals for the "Worked for" line and feeds the compaction advice. */
+async function onTurnComplete($: $, turnId: string, durationMs: number) {
+  const turn = await read($, TURN)
+  const steps = turn !== null && turn.turnId === turnId ? turn.steps : 0
+  if (turn !== null && turn.turnId === turnId && steps > 0) {
+    const done = { durationMs, steps, costUsd: turn.costUsd, readTokens: turn.readTokens, sentTokens: turn.sentTokens }
+    await update($, TURNS, list => [...(list ?? []), done].slice(-40))
+  }
   const now = await $.clock.now()
   await update($, COMPACT, prev =>
     prev === null ? null : { ...prev, lastResponseAt: now, stepsPerTurn: steps > 0 ? nextStepsPerTurn(prev.stepsPerTurn, steps) : prev.stepsPerTurn },
@@ -503,8 +533,13 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
+  on('turn.start', async ($, e, next) => {
+    await onTurnStart($, e.turnId)
+    return next(e)
+  })
+
   on('turn.complete', async ($, e, next) => {
-    if (e.agentId === undefined) await onTurnComplete($)
+    if (e.agentId === undefined) await onTurnComplete($, e.turnId, e.durationMs)
     return next(e)
   })
 
@@ -529,7 +564,41 @@ export const register: Register = (on, options) => {
   // The model and effort each main-thread request really went out with, a fallback included
   on('turn.step', async function* ($, e, next) {
     if (e.agentId === undefined) await onStep($, e.model, e.effort)
-    return yield* next(e)
+    const result = yield* next(e)
+    if (e.agentId === undefined) {
+      try {
+        await onStepDone($, e.turnId, result.usage)
+      } catch {
+        // The request already went through; only the count misses it
+      }
+    }
+    return result
+  })
+
+  // While Claude works: the context and what the turn has cost so far, after the spinner's own text
+  on('ui.render', { component: 'Spinner' }, async ($, e, next) => {
+    const reading = await read($, READING)
+    const turn = await read($, TURN)
+    const parts: string[] = []
+    if (reading?.percent !== undefined) parts.push(`ctx ${Math.round(reading.percent)}%`)
+    if (turn !== null && turn.steps > 0) parts.push(`turno ~${formatUsd(turn.costUsd)}`)
+    if (parts.length === 0) return next(e)
+    return next({ ...e, props: { ...e.props, suffix: `${e.props.suffix} · ${parts.join(' · ')}` } })
+  })
+
+  // When a turn ends: its requests, how much came from the cache and its cost, beside the engine's "Worked for"
+  on('ui.render', { component: 'TurnDuration' }, async ($, e, next) => {
+    const turns = await read($, TURNS)
+    const turn = findTurn(turns, e.props.durationMs)
+    const theirs = await next(e)
+    if (turn === undefined) return theirs
+    const { Box, Text } = $.ui.resolve(e)
+    return (
+      <Box flexDirection="row">
+        {theirs}
+        <Text dimColor>{`  ·  ${turnSummary(turn)}`}</Text>
+      </Box>
+    )
   })
 
   on('command.run', { command: 'cuota' }, async $ => {
