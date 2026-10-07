@@ -454,6 +454,74 @@ export function formatUsd(usd: number): string {
   return usd < 0.005 ? '<US$0,01' : `US$${usd.toFixed(2).replace('.', ',')}`
 }
 
+// ── The pace chart and the context grid ───────────────────────────────
+
+export type CellTone = Tone | 'dim'
+export type Cell = { char: string; tone: CellTone }
+
+/**
+ * Lays the five-hour window over `columns` columns of 10 minutes: what was measured up to now (the last
+ * samples, the live figure last), then the projection at the window's average rate.
+ */
+export function burnColumns(
+  series: readonly (number | null)[],
+  elapsed: number,
+  used: number,
+  columns = 30,
+): { values: (number | null)[]; nowCol: number } {
+  const nowCol = Math.max(0, Math.min(columns - 1, Math.floor(elapsed * columns)))
+  const values: (number | null)[] = []
+  let last: number | null = null
+  for (let c = 0; c <= nowCol; c++) {
+    const sample = series[series.length - 1 - (nowCol - c)] ?? null
+    if (sample !== null) last = sample
+    values.push(c === nowCol ? used : last)
+  }
+  const rate = used / (nowCol + 1)
+  for (let c = nowCol + 1; c < columns; c++) values.push(Math.min(100, used + rate * (c - nowCol)))
+  return { values, nowCol }
+}
+
+/** The chart as rows of cells, 100 % on top: measured in the traffic-light colors, projection as hatching, even pace dotted. */
+export function burnRows(values: readonly (number | null)[], nowCol: number, rows = 10): Cell[][] {
+  const step = 100 / rows
+  const out: Cell[][] = []
+  for (let r = 0; r < rows; r++) {
+    const top = 100 - r * step
+    const threshold = top - step / 2
+    const row: Cell[] = []
+    values.forEach((value, c) => {
+      const ideal = ((c + 1) / values.length) * 100
+      if (value !== null && value >= threshold) {
+        row.push(c <= nowCol ? { char: '█', tone: top >= 80 ? 'error' : top >= 50 ? 'warning' : 'success' } : { char: '▒', tone: 'warning' })
+      } else if (Math.abs(ideal - threshold) < step / 2) {
+        row.push({ char: '·', tone: 'dim' })
+      } else {
+        row.push({ char: ' ', tone: 'dim' })
+      }
+    })
+    out.push(row)
+  }
+  return out
+}
+
+/** Joins neighboring cells of one tone, so a row is a few texts and not one per cell. */
+export function cellRuns(cells: readonly Cell[]): { text: string; tone: CellTone }[] {
+  const runs: { text: string; tone: CellTone }[] = []
+  for (const cell of cells) {
+    const last = runs[runs.length - 1]
+    if (last !== undefined && last.tone === cell.tone) last.text += cell.char
+    else runs.push({ text: cell.char, tone: cell.tone })
+  }
+  return runs
+}
+
+/** A /context grid square as one character: full, partly full, or free. */
+export function gridGlyph(square: { isFilled: boolean; squareFullness: number }): string {
+  if (!square.isFilled) return '·'
+  return square.squareFullness >= 0.7 ? '■' : '▪'
+}
+
 // ── History kept in $.store ───────────────────────────────────────────
 
 /** One local day: slot (10-minute index, 0 to 143) to the peak [five_hour, seven_day] seen in it. */

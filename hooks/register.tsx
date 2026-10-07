@@ -15,8 +15,12 @@ import type {
   TurnUsage,
 } from 'claude-code'
 
-import type { CuotaCompact, CuotaHistory, CuotaModel, CuotaReading } from '../types'
+import type { CuotaCompact, CuotaGrid, CuotaHistory, CuotaModel, CuotaReading } from '../types'
 import {
+  burnColumns,
+  burnRows,
+  cellRuns,
+  gridGlyph,
   addUsage,
   findTurn,
   turnSummary,
@@ -57,7 +61,7 @@ import {
   weekGrid,
   weekKeys,
 } from './math'
-import type { Alert, CompactAdvice, DayRecord, Piece, Thresholds, Tone, WindowView } from './math'
+import type { Alert, CellTone, CompactAdvice, DayRecord, Thresholds, Tone, WindowView } from './math'
 import { SEGMENT_NAMES, STYLE_NAMES, asLayout, lineRows, moveSegment, shiftStyle, toggleSegment, withConfigStyle } from './line'
 import type { CacheState, Layout, LineInput } from './line'
 
@@ -81,6 +85,7 @@ const COMPACT = atom({ plugin: 'cuota', key: 'compact' } as const, null)
 const TURN = atom({ plugin: 'cuota', key: 'turn' } as const, null)
 const TURNS = atom({ plugin: 'cuota', key: 'turns' } as const, [])
 const LAYOUT = atom({ plugin: 'cuota', key: 'layout' } as const, null)
+const GRID = atom({ plugin: 'cuota', key: 'grid' } as const, null)
 const PANE_TAB = atom({ plugin: 'cuota', key: 'paneTab' } as const, 'resumen')
 
 /** The pane's tabs, in the order their digit hotkeys follow. */
@@ -182,6 +187,16 @@ async function refreshBreakdown($: $) {
     const u = await $.session.usage({ breakdown: 'summary' })
     const breakdown = u.context.breakdown
     if (breakdown !== undefined) {
+      // The same grid /context draws, square by square, with each category's own color
+      const grid: CuotaGrid = {
+        rows: breakdown.gridRows.map(row => row.map(square => ({ color: square.isFilled ? square.color : '', glyph: gridGlyph(square) }))),
+        legend: breakdown.categories
+          .filter(c => c.kind === 'used' && c.tokens > 0)
+          .sort((a, b) => b.tokens - a.tokens)
+          .slice(0, 8)
+          .map(c => ({ name: c.name, tokens: c.tokens, color: c.color })),
+      }
+      await update($, GRID, () => grid)
       await update($, COMPACT, prev =>
         prev === null
           ? null
@@ -834,6 +849,17 @@ export const register: Register = (on, options) => {
           : `${ctx.tokens === undefined ? '' : `${formatTokens(ctx.tokens)} / `}${formatTokens(ctx.window)}  ${Math.round(ctx.percent)} %`
       const ctxBar = bar((ctx.percent ?? 0) / 100, barWidth)
       const biggest = Math.max(1, ...(categories ?? []).map(c => c.tokens))
+      const grid = await read($, GRID)
+      // Neighboring squares of one color drawn as one text, a space after each square as /context spaces them
+      const gridRuns = (row: { color: string; glyph: string }[]) => {
+        const runs: { color: string; text: string }[] = []
+        for (const square of row) {
+          const last = runs[runs.length - 1]
+          if (last !== undefined && last.color === square.color) last.text += `${square.glyph} `
+          else runs.push({ color: square.color, text: `${square.glyph} ` })
+        }
+        return runs
+      }
       body = (
         <Box flexDirection="column">
           {head('CONTEXTO', ctxRight)}
@@ -841,27 +867,72 @@ export const register: Register = (on, options) => {
             <Text {...textProps({ tone: ctx.level === 'ok' ? 'success' : toneOf(ctx.level) })}>{ctxBar.full}</Text>
             <Text dimColor>{ctxBar.empty}</Text>
           </Box>
-          {(categories ?? []).map(c => (
-            <Text>{`  ${c.name.slice(0, 16).padEnd(16)} ${formatTokens(c.tokens).padStart(5)}  ${bar(c.tokens / biggest, 8).full}`}</Text>
-          ))}
-          {categories === null && <Text dimColor> Sin desglose: lo da /context.</Text>}
+          <Text> </Text>
+          {grid !== null &&
+            grid.rows.map(row => (
+              <Box flexDirection="row">
+                {gridRuns(row).map(run => (run.color === '' ? <Text dimColor>{run.text}</Text> : <Text color={run.color}>{run.text}</Text>))}
+              </Box>
+            ))}
+          {grid !== null && <Text> </Text>}
+          {grid !== null &&
+            grid.legend.map(c => (
+              <Box flexDirection="row">
+                <Text color={c.color}>{'■ '}</Text>
+                <Text>{`${c.name.slice(0, 22).padEnd(22)} ${formatTokens(c.tokens).padStart(5)}`}</Text>
+              </Box>
+            ))}
+          {grid === null &&
+            (categories ?? []).map(c => (
+              <Text>{`  ${c.name.slice(0, 16).padEnd(16)} ${formatTokens(c.tokens).padStart(5)}  ${bar(c.tokens / biggest, 8).full}`}</Text>
+            ))}
+          {grid === null && categories === null && <Text dimColor> Sin desglose: lo da /context.</Text>}
         </Box>
       )
     } else if (tab === 'ritmo') {
-      // ── Ritmo: the five-hour window over the last 5 hours ──
-      const series = history?.fiveSeries ?? []
-      let paceRow = <Text dimColor>{series.some(v => v !== null) ? spark(series, 30) : 'Sin muestras todavía.'}</Text>
-      if (e.surface === 'terminal' && series.some(v => v !== null)) {
-        const { Raster } = $.ui.resolve(e)
-        const cells = series.map(v => [(v === null ? '·' : sparkChar(v)).codePointAt(0) ?? 0x2588, heatColor(v), DEFAULT_COLOR] as const)
-        paceRow = <Raster key="pace" columns={series.length} rows={1} cells={packCells(cells)} />
+      // ── Ritmo: the five-hour window, used against time, with the projection and the even pace ──
+      const five = view.windows.find(w => w.kind === 'five_hour')
+      if (five === undefined || five.elapsed === undefined) {
+        body = (
+          <Box flexDirection="column">
+            {head('RITMO DE 5 H')}
+            <Text dimColor> Sin ventana de 5 h todavía: llega con la primera respuesta, sólo con suscripción.</Text>
+          </Box>
+        )
+      } else {
+        const { values, nowCol } = burnColumns(history?.fiveSeries ?? [], five.elapsed, five.used)
+        const rows = burnRows(values, nowCol, 10)
+        const atReset = values[values.length - 1] ?? five.used
+        const isAhead = five.isTrusted && five.pace !== undefined && five.pace > 1 && five.etaMs !== undefined
+        const verdict = isAhead
+          ? `llega al 100 % en ~${formatCountdown(five.etaMs ?? 0)}; el reset es en ${formatCountdown(five.leftMs ?? 0)}`
+          : `al ritmo de la ventana llega al reset con ~${Math.max(0, Math.round(100 - atReset))} % libre`
+        const tone = (cellTone: CellTone) => (cellTone === 'dim' ? { dimColor: true } : textProps({ tone: cellTone }))
+        body = (
+          <Box flexDirection="column">
+            {head('RITMO DE 5 H', 'usado contra tiempo')}
+            {rows.map((row, r) => (
+              <Box flexDirection="row">
+                <Text dimColor>{r === 0 ? '100 │' : r === 5 ? ' 50 │' : '    │'}</Text>
+                {cellRuns(row).map(run => (
+                  <Text {...tone(run.tone)}>{run.text}</Text>
+                ))}
+                <Text dimColor>{r === 0 ? '│ reset' : '│'}</Text>
+              </Box>
+            ))}
+            <Text dimColor>{`  0 └${'─'.repeat(values.length)}┘`}</Text>
+            <Text dimColor>{`${'     inicio'.padEnd(5 + nowCol)}↑ ahora`}</Text>
+            <Box flexDirection="row">
+              <Text {...textProps({ tone: 'error' })}>{'█'}</Text>
+              <Text>{' usado   '}</Text>
+              <Text {...textProps({ tone: 'warning' })}>{'▒'}</Text>
+              <Text>{' proyección   '}</Text>
+              <Text dimColor>{'· ritmo parejo'}</Text>
+            </Box>
+            <Text {...textProps({ tone: isAhead ? 'error' : 'text' })}>{verdict}</Text>
+          </Box>
+        )
       }
-      body = (
-        <Box flexDirection="column">
-          {head('RITMO DE 5 H', 'hace 5 h → ahora')}
-          {paceRow}
-        </Box>
-      )
     } else if (tab === 'semana') {
       // ── Semana: the five-hour window's peak per hour, seven days ──
       const week = history?.week ?? []

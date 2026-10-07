@@ -7,6 +7,10 @@ import {
   compactAdvice,
   compactAlertText,
   compactPayback,
+  burnColumns,
+  burnRows,
+  cellRuns,
+  gridGlyph,
   addUsage,
   cacheShare,
   findTurn,
@@ -330,5 +334,44 @@ describe('turno', () => {
     ]
     expect(findTurn(turns, 125_000)?.steps).toBe(9)
     expect(findTurn(turns, 300_000)).toBeUndefined()
+  })
+})
+
+describe('gráfico de ritmo', () => {
+  // 86 % usado con el 78 % de la ventana transcurrido: la columna 23 de 30
+  const series = [...Array<null>(20).fill(null), 40, 50, 60, 70, 75, 80, 82, 84, 85, 86]
+
+  test('las columnas: lo medido hasta ahora y la proyección después', () => {
+    const { values, nowCol } = burnColumns(series, 0.78, 86)
+    expect(nowCol).toBe(23)
+    expect(values[23]).toBe(86)
+    expect(values[22]).toBe(85)
+    expect(values[0]).toBeNull()
+    // Al ritmo medio de la ventana (86/24 por columna) cruza el 100 % en la columna 27
+    expect(values[26]).toBeLessThan(100)
+    expect(values[27]).toBe(100)
+  })
+
+  test('las filas: usado en rojo arriba, proyección como trama y el ritmo parejo punteado', () => {
+    const { values, nowCol } = burnColumns(series, 0.78, 86)
+    const rows = burnRows(values, nowCol, 10)
+    expect(rows).toHaveLength(10)
+    expect(rows[1]?.[23]).toEqual({ char: '█', tone: 'error' })
+    expect(rows[0]?.[23]?.char).not.toBe('█')
+    expect(rows[0]?.[27]).toEqual({ char: '▒', tone: 'warning' })
+    expect(rows.some(row => row.some(cell => cell.char === '·'))).toBe(true)
+  })
+
+  test('las celdas iguales seguidas se dibujan juntas', () => {
+    expect(cellRuns([{ char: '█', tone: 'error' }, { char: '█', tone: 'error' }, { char: ' ', tone: 'dim' }])).toEqual([
+      { text: '██', tone: 'error' },
+      { text: ' ', tone: 'dim' },
+    ])
+  })
+
+  test('el cuadro de la grilla de contexto según qué tan lleno está', () => {
+    expect(gridGlyph({ isFilled: true, squareFullness: 1 })).toBe('■')
+    expect(gridGlyph({ isFilled: true, squareFullness: 0.3 })).toBe('▪')
+    expect(gridGlyph({ isFilled: false, squareFullness: 0 })).toBe('·')
   })
 })

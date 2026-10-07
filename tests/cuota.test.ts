@@ -1,6 +1,6 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine, MockClock } from 'claude-code/testing'
-import type { On, SessionCompactResult, SessionRateLimit, SessionUsage } from 'claude-code'
+import type { On, SessionCompactResult, SessionContextBreakdown, SessionRateLimit, SessionUsage } from 'claude-code'
 
 const MIN = 60_000
 // Miércoles 7 de octubre de 2026, 14:05, hora local de quien corre el test
@@ -74,7 +74,10 @@ async function start(
   const clock = mock.clock(on, { now: NOW })
   const seen: Seen = { toasts: [], statuses: [], opened: [], fills: [], compacted: 0, clock }
   mock.store(on)
-  on('session.usage', () => ({ value: figures }))
+  // With `breakdown` asked for, the figures carry the /context breakdown, grid included
+  on('session.usage', ($, e) => ({
+    value: (e as { breakdown?: unknown } | undefined)?.breakdown === undefined ? figures : { ...figures, context: { ...figures.context, breakdown: BREAKDOWN } },
+  }))
   on('session.model', () => ({ value: 'claude-opus-5-5' }))
   on('session.turns', () => ({ value: 23 }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
@@ -116,6 +119,40 @@ async function start(
   })
   await $.session.start({ cwd: '.', surface: 'terminal', isInteractive: true })
   return seen
+}
+
+const square = (color: string, isFilled: boolean, categoryName: string) => ({
+  color,
+  isFilled,
+  categoryName,
+  tokens: 1_500,
+  percentage: 0.5,
+  squareFullness: isFilled ? 1 : 0,
+})
+
+/** A /context breakdown: the system prompt, the messages and free room, with its grid. */
+const BREAKDOWN: SessionContextBreakdown = {
+  categories: [
+    { name: 'System prompt', tokens: 3_000, color: 'promptBorder', isDeferred: false, kind: 'used' },
+    { name: 'Messages', tokens: 71_000, color: 'claude', isDeferred: false, kind: 'used' },
+    { name: 'Free space', tokens: 226_000, color: 'inactive', isDeferred: false, kind: 'free' },
+  ],
+  totalTokens: 74_000,
+  maxTokens: 300_000,
+  rawMaxTokens: 300_000,
+  autocompactSource: 'settings',
+  percentage: 25,
+  gridRows: [
+    [square('promptBorder', true, 'System prompt'), square('claude', true, 'Messages'), square('claude', true, 'Messages')],
+    [square('claude', true, 'Messages'), square('inactive', false, 'Free space'), square('inactive', false, 'Free space')],
+  ],
+  model: 'claude-opus-5-5',
+  memoryFiles: [],
+  mcpTools: [],
+  agents: [],
+  isAutoCompactEnabled: true,
+  autoCompactThreshold: 300_000,
+  apiUsage: null,
 }
 
 const STEP_USAGE = { input_tokens: 2_000, output_tokens: 1_000, cache_read_input_tokens: 100_000, cache_creation_input_tokens: 5_000 }
@@ -342,5 +379,34 @@ describe('diseño de la línea', () => {
     expect(texts).not.toContain('ctx 31%')
     expect(texts).toContain('●')
     await line.unmount()
+  })
+})
+
+describe('panel con gráficos', () => {
+  const OPEN = { command: 'cuota', args: '', origin: { kind: 'composer' as const }, presentation: { isFullscreen: true, columns: 150 } }
+
+  test('Ritmo: el gráfico de lo usado contra el tiempo y cuándo cruza el 100 %', async ($, on) => {
+    await start($, on, big(150_000, [five(86, 65)]))
+    await $.command.run(OPEN)
+    for (const surface of ['terminal', 'desktop'] as const) {
+      const ui = await $.ui.mount({ ...PANE, surface })
+      await ui.press({ key: 'tab-ritmo' })
+      expect(await ui.find({ text: /usado contra tiempo/ })).toBeDefined()
+      expect(await ui.find({ text: /llega al 100 % en ~38 min; el reset es en 1h05/ })).toBeDefined()
+      expect((await ui.findAll({ type: 'Text', text: /█/ })).length).toBeGreaterThan(0)
+      await ui.press({ key: 'tab-resumen' })
+      await ui.unmount()
+    }
+  })
+
+  test('Contexto: la grilla de /context con el color de cada categoría', async ($, on) => {
+    await start($, on, big(150_000, [five(30, 200)]))
+    await $.command.run(OPEN)
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    await ui.press({ key: 'tab-contexto' })
+    const squares = await ui.findAll({ type: 'Text', text: /■/ })
+    expect(squares.some(found => found.props.color === 'claude' && found.text.startsWith('■ ■'))).toBe(true)
+    expect(await ui.find({ text: /Messages/ })).toBeDefined()
+    await ui.unmount()
   })
 })

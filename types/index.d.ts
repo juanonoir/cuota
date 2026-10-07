@@ -53,9 +53,16 @@ export type CuotaTurnDone = { durationMs: number; steps: number; costUsd: number
 /** The line's design as the Design tab saves it (hooks/line.ts validates it as a Layout). */
 export type CuotaLayout = { order: string[]; hidden: string[]; style: string; configStyle?: string }
 
+/** The /context grid as the pane draws it: one character and one color per square, and the categories' legend. */
+export type CuotaGrid = {
+  rows: { color: string; glyph: string }[][]
+  legend: { name: string; tokens: number; color: string }[]
+}
+
 declare module 'claude-code' {
   interface PluginState {
     cuota: {
+      grid: CuotaGrid | null
       layout: CuotaLayout | null
       paneTab: string
       turn: CuotaTurn | null
